@@ -6,6 +6,7 @@ import asyncio
 import collections
 import contextvars
 import inspect
+import json
 import logging
 import random
 import sys
@@ -23,6 +24,8 @@ from typing import (
     Deque,
     Dict,
     Generator,
+    Generic,
+    Iterable,
     Iterator,
     List,
     Mapping,
@@ -38,11 +41,12 @@ from typing import (
     cast,
 )
 
-from typing_extensions import TypeAlias, TypedDict
+from typing_extensions import Self, TypeAlias, TypedDict
 
 import temporalio.activity
 import temporalio.api.common.v1
 import temporalio.api.enums.v1
+import temporalio.api.sdk.v1
 import temporalio.bridge.proto.activity_result
 import temporalio.bridge.proto.child_workflow
 import temporalio.bridge.proto.workflow_activation
@@ -52,6 +56,7 @@ import temporalio.common
 import temporalio.converter
 import temporalio.exceptions
 import temporalio.workflow
+from temporalio.service import __version__
 
 from ._interceptor import (
     ContinueAsNewInput,
@@ -69,6 +74,9 @@ from ._interceptor import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Set to true to log all cases where we're ignoring things during delete
+LOG_IGNORE_DURING_DELETE = False
 
 
 class WorkflowRunner(ABC):
@@ -103,6 +111,17 @@ class WorkflowRunner(ABC):
         """
         raise NotImplementedError
 
+    def set_worker_level_failure_exception_types(
+        self, types: Sequence[Type[BaseException]]
+    ) -> None:
+        """Set worker-level failure exception types that will be used to
+        validate in the sandbox when calling ``prepare_workflow``.
+
+        Args:
+            types: Exception types.
+        """
+        pass
+
 
 @dataclass(frozen=True)
 class WorkflowInstanceDetails:
@@ -116,6 +135,7 @@ class WorkflowInstanceDetails:
     randomness_seed: int
     extern_functions: Mapping[str, Callable]
     disable_eager_activity_execution: bool
+    worker_level_failure_exception_types: Sequence[Type[BaseException]]
 
 
 class WorkflowInstance(ABC):
@@ -173,6 +193,9 @@ class _WorkflowInstanceImpl(
         self._info = det.info
         self._extern_functions = det.extern_functions
         self._disable_eager_activity_execution = det.disable_eager_activity_execution
+        self._worker_level_failure_exception_types = (
+            det.worker_level_failure_exception_types
+        )
         self._primary_task: Optional[asyncio.Task[None]] = None
         self._time_ns = 0
         self._cancel_requested = False
@@ -218,6 +241,14 @@ class _WorkflowInstanceImpl(
         self._queries = dict(self._defn.queries)
         self._updates = dict(self._defn.updates)
 
+        # We record in-progress signals and updates in order to support waiting for handlers to
+        # finish, and issuing warnings when the workflow exits with unfinished handlers. Since
+        # signals lack a unique per-invocation identifier, we introduce a sequence number for the
+        # purpose.
+        self._handled_signals_seq = 0
+        self._in_progress_signals: Dict[int, HandlerExecution] = {}
+        self._in_progress_updates: Dict[str, HandlerExecution] = {}
+
         # Add stack trace handler
         # TODO(cretz): Is it ok that this can be forcefully overridden by the
         # workflow author? They could technically override in interceptor
@@ -229,6 +260,14 @@ class _WorkflowInstanceImpl(
             is_method=False,
             arg_types=[],
             ret_type=str,
+        )
+
+        self._queries["__enhanced_stack_trace"] = temporalio.workflow._QueryDefinition(
+            name="__enhanced_stack_trace",
+            fn=self._enhanced_stack_trace,
+            is_method=False,
+            arg_types=[],
+            ret_type=temporalio.api.sdk.v1.EnhancedStackTrace,
         )
 
         # Maintain buffered signals for later-added dynamic handlers
@@ -254,18 +293,12 @@ class _WorkflowInstanceImpl(
         # Set ourselves on our own loop
         temporalio.workflow._Runtime.set_on_loop(self, self)
 
-        # After GC, Python raises GeneratorExit calls from all awaiting tasks.
-        # Then in a finally of such an await, another exception can swallow
-        # these causing even more issues. We will set ourselves as deleted so we
-        # can check in some places to swallow these errors on tear down.
+        # When we evict, we have to mark the workflow as deleting so we don't
+        # add any commands and we swallow exceptions on tear down
         self._deleting = False
 
         # We only create the metric meter lazily
         self._metric_meter: Optional[_ReplaySafeMetricMeter] = None
-
-    def __del__(self) -> None:
-        # We have confirmed there are no super() versions of __del__
-        self._deleting = True
 
     #### Activation functions ####
     # These are in alphabetical order and besides "activate", all other calls
@@ -289,15 +322,15 @@ class _WorkflowInstanceImpl(
 
         activation_err: Optional[Exception] = None
         try:
-            # Split into job sets with patches, then signals, then non-queries, then
-            # queries
+            # Split into job sets with patches, then signals + updates, then
+            # non-queries, then queries
             job_sets: List[
                 List[temporalio.bridge.proto.workflow_activation.WorkflowActivationJob]
             ] = [[], [], [], []]
             for job in act.jobs:
                 if job.HasField("notify_has_patch"):
                     job_sets[0].append(job)
-                elif job.HasField("signal_workflow"):
+                elif job.HasField("signal_workflow") or job.HasField("do_update"):
                     job_sets[1].append(job)
                 elif not job.HasField("query_workflow"):
                     job_sets[2].append(job)
@@ -316,20 +349,43 @@ class _WorkflowInstanceImpl(
                 # be checked in patch jobs (first index) or query jobs (last
                 # index).
                 self._run_once(check_conditions=index == 1 or index == 2)
-        except temporalio.exceptions.FailureError as err:
-            # We want failure errors during activation, like those that can
-            # happen during payload conversion, to fail the workflow not the
-            # task
-            try:
-                self._set_workflow_failure(err)
-            except Exception as inner_err:
-                activation_err = inner_err
         except Exception as err:
-            activation_err = err
+            # We want some errors during activation, like those that can happen
+            # during payload conversion, to be able to fail the workflow not the
+            # task
+            if self._is_workflow_failure_exception(err):
+                try:
+                    self._set_workflow_failure(err)
+                except Exception as inner_err:
+                    activation_err = inner_err
+            else:
+                # Otherwise all exceptions are activation errors
+                activation_err = err
+            # If we're deleting, swallow any activation error
+            if self._deleting:
+                if LOG_IGNORE_DURING_DELETE:
+                    logger.debug(
+                        "Ignoring exception while deleting workflow", exc_info=True
+                    )
+                activation_err = None
+
+        # If we're deleting, there better be no more tasks. It is important for
+        # the integrity of the system that we check this. If there are tasks
+        # remaining, they and any associated coroutines will get garbage
+        # collected which can trigger a GeneratorExit exception thrown in the
+        # coroutine which can cause it to wakeup on a different thread which may
+        # have a different workflow/event-loop going.
+        if self._deleting and self._tasks:
+            raise RuntimeError(
+                f"Eviction processed, but {len(self._tasks)} tasks remain. "
+                + f"Stack traces below:\n\n{self._stack_trace()}"
+            )
+
         if activation_err:
             logger.warning(
                 f"Failed activation on workflow {self._info.workflow_type} with ID {self._info.workflow_id} and run ID {self._info.run_id}",
                 exc_info=activation_err,
+                extra={"temporal_workflow": self._info._logger_details()},
             )
             # Set completion failure
             self._current_completion.failed.failure.SetInParent()
@@ -359,12 +415,15 @@ class _WorkflowInstanceImpl(
                     command.HasField("complete_workflow_execution")
                     or command.HasField("continue_as_new_workflow_execution")
                     or command.HasField("fail_workflow_execution")
+                    or command.HasField("cancel_workflow_execution")
                 )
             elif not command.HasField("respond_to_query"):
                 del self._current_completion.successful.commands[i]
                 continue
             i += 1
 
+        if seen_completion:
+            self._warn_if_unfinished_handlers()
         return self._current_completion
 
     def _apply(
@@ -381,8 +440,7 @@ class _WorkflowInstanceImpl(
         elif job.HasField("notify_has_patch"):
             self._apply_notify_has_patch(job.notify_has_patch)
         elif job.HasField("remove_from_cache"):
-            # Ignore, handled externally
-            pass
+            self._apply_remove_from_cache(job.remove_from_cache)
         elif job.HasField("resolve_activity"):
             self._apply_resolve_activity(job.resolve_activity)
         elif job.HasField("resolve_child_workflow_execution"):
@@ -428,6 +486,11 @@ class _WorkflowInstanceImpl(
         # inside the task, since the update may not be defined until after we have started the workflow - for example
         # if an update is in the first WFT & is also registered dynamically at the top of workflow code.
         async def run_update() -> None:
+            # Set the current update for the life of this task
+            temporalio.workflow._set_current_update_info(
+                temporalio.workflow.UpdateInfo(id=job.id, name=job.name)
+            )
+
             command = self._add_command()
             command.update_response.protocol_instance_id = job.protocol_instance_id
             past_validation = False
@@ -439,6 +502,9 @@ class _WorkflowInstanceImpl(
                         f"Update handler for '{job.name}' expected but not found, and there is no dynamic handler. "
                         f"known updates: [{' '.join(known_updates)}]"
                     )
+                self._in_progress_updates[job.id] = HandlerExecution(
+                    job.name, defn.unfinished_policy, job.id
+                )
                 args = self._process_handler_args(
                     job.name,
                     job.input,
@@ -495,12 +561,10 @@ class _WorkflowInstanceImpl(
                 if isinstance(err, temporalio.workflow.ReadOnlyContextError):
                     self._current_activation_error = err
                     return
-                # Temporal errors always fail the update. Other errors fail it during validation, but the task during
-                # handling.
-                if (
-                    isinstance(err, temporalio.exceptions.FailureError)
-                    or not past_validation
-                ):
+                # Validation failures are always update failures. We reuse
+                # workflow failure logic to decide task failure vs update
+                # failure after validation.
+                if not past_validation or self._is_workflow_failure_exception(err):
                     if command is None:
                         command = self._add_command()
                         command.update_response.protocol_instance_id = (
@@ -516,19 +580,15 @@ class _WorkflowInstanceImpl(
                     self._current_activation_error = err
                     return
             except BaseException as err:
-                # During tear down, generator exit and no-runtime exceptions can appear
-                if not self._deleting:
-                    raise
-                if not isinstance(
-                    err,
-                    (
-                        GeneratorExit,
-                        temporalio.workflow._NotInWorkflowEventLoopError,
-                    ),
-                ):
-                    logger.debug(
-                        "Ignoring exception while deleting workflow", exc_info=True
-                    )
+                if self._deleting:
+                    if LOG_IGNORE_DURING_DELETE:
+                        logger.debug(
+                            "Ignoring exception while deleting workflow", exc_info=True
+                        )
+                    return
+                raise
+            finally:
+                self._in_progress_updates.pop(job.id, None)
 
         self.create_task(
             run_update(),
@@ -604,6 +664,18 @@ class _WorkflowInstanceImpl(
         self, job: temporalio.bridge.proto.workflow_activation.NotifyHasPatch
     ) -> None:
         self._patches_notified.add(job.patch_id)
+
+    def _apply_remove_from_cache(
+        self, job: temporalio.bridge.proto.workflow_activation.RemoveFromCache
+    ) -> None:
+        self._deleting = True
+        self._cancel_requested = True
+        # We consider eviction to be under replay so that certain code like
+        # logging that avoids replaying doesn't run during eviction either
+        self._is_replaying = True
+        # Cancel everything
+        for task in self._tasks:
+            task.cancel()
 
     def _apply_resolve_activity(
         self, job: temporalio.bridge.proto.workflow_activation.ResolveActivity
@@ -774,17 +846,14 @@ class _WorkflowInstanceImpl(
                     )
                 command = self._add_command()
                 command.complete_workflow_execution.result.CopyFrom(result_payloads[0])
-            except BaseException as err:
-                # During tear down, generator exit and event loop exceptions can occur
-                if not self._deleting:
-                    raise
-                if not isinstance(
-                    err,
-                    (GeneratorExit, temporalio.workflow._NotInWorkflowEventLoopError),
-                ):
-                    logger.debug(
-                        "Ignoring exception while deleting workflow", exc_info=True
-                    )
+            except Exception:
+                if self._deleting:
+                    if LOG_IGNORE_DURING_DELETE:
+                        logger.debug(
+                            "Ignoring exception while deleting workflow", exc_info=True
+                        )
+                    return
+                raise
 
         # Set arg types, using raw values for dynamic
         arg_types = self._defn.arg_types
@@ -816,6 +885,9 @@ class _WorkflowInstanceImpl(
 
     #### _Runtime direct workflow call overrides ####
     # These are in alphabetical order and all start with "workflow_".
+
+    def workflow_all_handlers_finished(self) -> bool:
+        return not self._in_progress_updates and not self._in_progress_signals
 
     def workflow_continue_as_new(
         self,
@@ -1477,7 +1549,13 @@ class _WorkflowInstanceImpl(
         finally:
             self._read_only = prev_val
 
-    def _assert_not_read_only(self, action_attempted: str) -> None:
+    def _assert_not_read_only(
+        self, action_attempted: str, *, allow_during_delete: bool = False
+    ) -> None:
+        if self._deleting and not allow_during_delete:
+            raise _WorkflowBeingEvictedError(
+                f"Ignoring {action_attempted} while evicting workflow. This is not an error."
+            )
         if self._read_only:
             raise temporalio.workflow.ReadOnlyContextError(
                 f"While in read-only function, action attempted: {action_attempted}"
@@ -1524,6 +1602,44 @@ class _WorkflowInstanceImpl(
             raise
         except Exception as err:
             raise RuntimeError("Failed decoding arguments") from err
+
+    def _is_workflow_failure_exception(self, err: BaseException) -> bool:
+        # An exception is a failure instead of a task fail if it's already a
+        # failure error or if it is an instance of any of the failure types in
+        # the worker or workflow-level setting
+        return (
+            isinstance(err, temporalio.exceptions.FailureError)
+            or any(isinstance(err, typ) for typ in self._defn.failure_exception_types)
+            or any(
+                isinstance(err, typ)
+                for typ in self._worker_level_failure_exception_types
+            )
+        )
+
+    def _warn_if_unfinished_handlers(self) -> None:
+        def warnable(handler_executions: Iterable[HandlerExecution]):
+            return [
+                ex
+                for ex in handler_executions
+                if ex.unfinished_policy
+                == temporalio.workflow.HandlerUnfinishedPolicy.WARN_AND_ABANDON
+            ]
+
+        warnable_updates = warnable(self._in_progress_updates.values())
+        if warnable_updates:
+            warnings.warn(
+                temporalio.workflow.UnfinishedUpdateHandlersWarning(
+                    _make_unfinished_update_handler_message(warnable_updates)
+                )
+            )
+
+        warnable_signals = warnable(self._in_progress_signals.values())
+        if warnable_signals:
+            warnings.warn(
+                temporalio.workflow.UnfinishedSignalHandlersWarning(
+                    _make_unfinished_signal_handler_message(warnable_signals)
+                )
+            )
 
     def _next_seq(self, type: str) -> int:
         seq = self._curr_seqs.get(type, 0) + 1
@@ -1575,10 +1691,21 @@ class _WorkflowInstanceImpl(
         input = HandleSignalInput(
             signal=job.signal_name, args=args, headers=job.headers
         )
-        self.create_task(
+
+        self._handled_signals_seq += 1
+        id = self._handled_signals_seq
+        self._in_progress_signals[id] = HandlerExecution(
+            job.signal_name, defn.unfinished_policy
+        )
+
+        def done_callback(f):
+            self._in_progress_signals.pop(id, None)
+
+        task = self.create_task(
             self._run_top_level_workflow_function(self._inbound.handle_signal(input)),
             name=f"signal: {job.signal_name}",
         )
+        task.add_done_callback(done_callback)
 
     def _register_task(
         self,
@@ -1620,9 +1747,9 @@ class _WorkflowInstanceImpl(
                     handle = self._ready.popleft()
                     handle._run()
 
-                    # Must throw here. Only really set inside
+                    # Must throw here if not deleting. Only really set inside
                     # _run_top_level_workflow_function.
-                    if self._current_activation_error:
+                    if self._current_activation_error and not self._deleting:
                         raise self._current_activation_error
 
                 # Check conditions which may add to the ready list. Also remove
@@ -1645,12 +1772,23 @@ class _WorkflowInstanceImpl(
         except _ContinueAsNewError as err:
             logger.debug("Workflow requested continue as new")
             err._apply_command(self._add_command())
-
-        # Note in some Python versions, cancelled error does not extend
-        # exception
-        # TODO(cretz): Should I fail the task on BaseException too (e.g.
-        # KeyboardInterrupt)?
         except (Exception, asyncio.CancelledError) as err:
+            # During tear down we can ignore exceptions. Technically the
+            # command-adding done later would throw a not-in-workflow exception
+            # we'd ignore later, but it's better to preempt it
+            if self._deleting:
+                if LOG_IGNORE_DURING_DELETE:
+                    logger.debug(
+                        "Ignoring exception while deleting workflow", exc_info=True
+                    )
+                return
+
+            # Handle continue as new
+            if isinstance(err, _ContinueAsNewError):
+                logger.debug("Workflow requested continue as new")
+                err._apply_command(self._add_command())
+                return
+
             logger.debug(
                 f"Workflow raised failure with run ID {self._info.run_id}",
                 exc_info=True,
@@ -1670,24 +1808,14 @@ class _WorkflowInstanceImpl(
                 err
             ):
                 self._add_command().cancel_workflow_execution.SetInParent()
-            elif isinstance(err, temporalio.exceptions.FailureError):
+            elif self._is_workflow_failure_exception(err):
                 # All other failure errors fail the workflow
                 self._set_workflow_failure(err)
             else:
                 # All other exceptions fail the task
                 self._current_activation_error = err
-        except BaseException as err:
-            # During tear down, generator exit and no-runtime exceptions can appear
-            if not self._deleting:
-                raise
-            if not isinstance(
-                err, (GeneratorExit, temporalio.workflow._NotInWorkflowEventLoopError)
-            ):
-                logger.debug(
-                    "Ignoring exception while deleting workflow", exc_info=True
-                )
 
-    def _set_workflow_failure(self, err: temporalio.exceptions.FailureError) -> None:
+    def _set_workflow_failure(self, err: BaseException) -> None:
         # All other failure errors fail the workflow
         failure = self._add_command().fail_workflow_execution.failure
         failure.SetInParent()
@@ -1720,7 +1848,7 @@ class _WorkflowInstanceImpl(
 
     def _stack_trace(self) -> str:
         stacks = []
-        for task in self._tasks:
+        for task in list(self._tasks):
             # TODO(cretz): These stacks are not very clean currently
             frames = []
             for frame in task.get_stack():
@@ -1734,6 +1862,53 @@ class _WorkflowInstanceImpl(
                 + "\n".join(traceback.format_list(frames))
             )
         return "\n\n".join(stacks)
+
+    def _enhanced_stack_trace(self) -> temporalio.api.sdk.v1.EnhancedStackTrace:
+        sdk = temporalio.api.sdk.v1.StackTraceSDKInfo(
+            name="sdk-python", version=__version__
+        )
+
+        # this is to use `open`
+        with temporalio.workflow.unsafe.sandbox_unrestricted():
+            sources = dict()
+            stacks = []
+
+            for task in list(self._tasks):
+                locations = []
+                for frame in task.get_stack():
+                    filename = frame.f_code.co_filename
+                    line_number = frame.f_lineno
+                    func_name = frame.f_code.co_name
+
+                    try:
+                        with open(filename, "r") as f:
+                            code = f.read()
+                    except OSError as ose:
+                        code = f"Cannot access code.\n---\n{ose.strerror}"
+                        # TODO possibly include sentinel/property for success of src scrape? work out with ui
+                    except Exception:
+                        code = f"Generic Error.\n\n{traceback.format_exc()}"
+
+                    file_slice = temporalio.api.sdk.v1.StackTraceFileSlice(
+                        line_offset=0, content=code
+                    )
+                    file_location = temporalio.api.sdk.v1.StackTraceFileLocation(
+                        file_path=filename,
+                        line=line_number,
+                        column=-1,
+                        function_name=func_name,
+                        internal_code=False,
+                    )
+
+                    sources[filename] = file_slice
+                    locations.append(file_location)
+
+                stacks.append(temporalio.api.sdk.v1.StackTrace(locations=locations))
+
+            est = temporalio.api.sdk.v1.EnhancedStackTrace(
+                sdk=sdk, sources=sources, stacks=stacks
+            )
+            return est
 
     #### asyncio.AbstractEventLoop function impls ####
     # These are in the order defined in CPython's impl of the base class. Many
@@ -1752,7 +1927,9 @@ class _WorkflowInstanceImpl(
         *args: Any,
         context: Optional[contextvars.Context] = None,
     ) -> asyncio.Handle:
-        self._assert_not_read_only("schedule task")
+        # We need to allow this during delete because this is how tasks schedule
+        # entire cancellation calls
+        self._assert_not_read_only("schedule task", allow_during_delete=True)
         handle = asyncio.Handle(callback, args, self, context)
         self._ready.append(handle)
         return handle
@@ -1856,6 +2033,9 @@ class _WorkflowInstanceImpl(
         logger.error("\n".join(log_lines), exc_info=exc_info)
 
     def call_exception_handler(self, context: _Context) -> None:
+        # Do nothing with any uncaught exceptions while deleting
+        if self._deleting:
+            return
         # Copied and slightly modified from
         # asyncio.BaseEventLoop.call_exception_handler
         if self._exception_handler is None:
@@ -2045,12 +2225,15 @@ class _ActivityHandle(temporalio.workflow.ActivityHandle[Any]):
         instance._register_task(self, name=f"activity: {input.activity}")
 
     def cancel(self, msg: Optional[Any] = None) -> bool:
-        self._instance._assert_not_read_only("cancel activity handle")
-        # We override this because if it's not yet started and not done, we need
-        # to send a cancel command because the async function won't run to trap
-        # the cancel (i.e. cancelled before started)
-        if not self._started and not self.done():
-            self._apply_cancel_command(self._instance._add_command())
+        # Allow the cancel to go through for the task even if we're deleting,
+        # just don't do any commands
+        if not self._instance._deleting:
+            self._instance._assert_not_read_only("cancel activity handle")
+            # We override this because if it's not yet started and not done, we need
+            # to send a cancel command because the async function won't run to trap
+            # the cancel (i.e. cancelled before started)
+            if not self._started and not self.done():
+                self._apply_cancel_command(self._instance._add_command())
         # Message not supported in older versions
         if sys.version_info < (3, 9):
             return super().cancel()
@@ -2416,11 +2599,32 @@ class _ReplaySafeMetricMeter(temporalio.common.MetricMeter):
             self._underlying.create_histogram(name, description, unit)
         )
 
+    def create_histogram_float(
+        self, name: str, description: Optional[str] = None, unit: Optional[str] = None
+    ) -> temporalio.common.MetricHistogramFloat:
+        return _ReplaySafeMetricHistogramFloat(
+            self._underlying.create_histogram_float(name, description, unit)
+        )
+
+    def create_histogram_timedelta(
+        self, name: str, description: Optional[str] = None, unit: Optional[str] = None
+    ) -> temporalio.common.MetricHistogramTimedelta:
+        return _ReplaySafeMetricHistogramTimedelta(
+            self._underlying.create_histogram_timedelta(name, description, unit)
+        )
+
     def create_gauge(
         self, name: str, description: Optional[str] = None, unit: Optional[str] = None
     ) -> temporalio.common.MetricGauge:
         return _ReplaySafeMetricGauge(
             self._underlying.create_gauge(name, description, unit)
+        )
+
+    def create_gauge_float(
+        self, name: str, description: Optional[str] = None, unit: Optional[str] = None
+    ) -> temporalio.common.MetricGaugeFloat:
+        return _ReplaySafeMetricGaugeFloat(
+            self._underlying.create_gauge_float(name, description, unit)
         )
 
     def with_additional_attributes(
@@ -2431,8 +2635,11 @@ class _ReplaySafeMetricMeter(temporalio.common.MetricMeter):
         )
 
 
-class _ReplaySafeMetricCounter(temporalio.common.MetricCounter):
-    def __init__(self, underlying: temporalio.common.MetricCounter) -> None:
+_MetricType = TypeVar("_MetricType", bound=temporalio.common.MetricCommon)
+
+
+class _ReplaySafeMetricCommon(temporalio.common.MetricCommon, Generic[_MetricType]):
+    def __init__(self, underlying: _MetricType) -> None:
         self._underlying = underlying
 
     @property
@@ -2447,6 +2654,18 @@ class _ReplaySafeMetricCounter(temporalio.common.MetricCounter):
     def unit(self) -> Optional[str]:
         return self._underlying.unit
 
+    def with_additional_attributes(
+        self, additional_attributes: temporalio.common.MetricAttributes
+    ) -> Self:
+        return self.__class__(
+            self._underlying.with_additional_attributes(additional_attributes)
+        )
+
+
+class _ReplaySafeMetricCounter(
+    temporalio.common.MetricCounter,
+    _ReplaySafeMetricCommon[temporalio.common.MetricCounter],
+):
     def add(
         self,
         value: int,
@@ -2455,30 +2674,11 @@ class _ReplaySafeMetricCounter(temporalio.common.MetricCounter):
         if not temporalio.workflow.unsafe.is_replaying():
             self._underlying.add(value, additional_attributes)
 
-    def with_additional_attributes(
-        self, additional_attributes: temporalio.common.MetricAttributes
-    ) -> temporalio.common.MetricCounter:
-        return _ReplaySafeMetricCounter(
-            self._underlying.with_additional_attributes(additional_attributes)
-        )
 
-
-class _ReplaySafeMetricHistogram(temporalio.common.MetricHistogram):
-    def __init__(self, underlying: temporalio.common.MetricHistogram) -> None:
-        self._underlying = underlying
-
-    @property
-    def name(self) -> str:
-        return self._underlying.name
-
-    @property
-    def description(self) -> Optional[str]:
-        return self._underlying.description
-
-    @property
-    def unit(self) -> Optional[str]:
-        return self._underlying.unit
-
+class _ReplaySafeMetricHistogram(
+    temporalio.common.MetricHistogram,
+    _ReplaySafeMetricCommon[temporalio.common.MetricHistogram],
+):
     def record(
         self,
         value: int,
@@ -2487,30 +2687,37 @@ class _ReplaySafeMetricHistogram(temporalio.common.MetricHistogram):
         if not temporalio.workflow.unsafe.is_replaying():
             self._underlying.record(value, additional_attributes)
 
-    def with_additional_attributes(
-        self, additional_attributes: temporalio.common.MetricAttributes
-    ) -> temporalio.common.MetricHistogram:
-        return _ReplaySafeMetricHistogram(
-            self._underlying.with_additional_attributes(additional_attributes)
-        )
+
+class _ReplaySafeMetricHistogramFloat(
+    temporalio.common.MetricHistogramFloat,
+    _ReplaySafeMetricCommon[temporalio.common.MetricHistogramFloat],
+):
+    def record(
+        self,
+        value: float,
+        additional_attributes: Optional[temporalio.common.MetricAttributes] = None,
+    ) -> None:
+        if not temporalio.workflow.unsafe.is_replaying():
+            self._underlying.record(value, additional_attributes)
 
 
-class _ReplaySafeMetricGauge(temporalio.common.MetricGauge):
-    def __init__(self, underlying: temporalio.common.MetricGauge) -> None:
-        self._underlying = underlying
+class _ReplaySafeMetricHistogramTimedelta(
+    temporalio.common.MetricHistogramTimedelta,
+    _ReplaySafeMetricCommon[temporalio.common.MetricHistogramTimedelta],
+):
+    def record(
+        self,
+        value: timedelta,
+        additional_attributes: Optional[temporalio.common.MetricAttributes] = None,
+    ) -> None:
+        if not temporalio.workflow.unsafe.is_replaying():
+            self._underlying.record(value, additional_attributes)
 
-    @property
-    def name(self) -> str:
-        return self._underlying.name
 
-    @property
-    def description(self) -> Optional[str]:
-        return self._underlying.description
-
-    @property
-    def unit(self) -> Optional[str]:
-        return self._underlying.unit
-
+class _ReplaySafeMetricGauge(
+    temporalio.common.MetricGauge,
+    _ReplaySafeMetricCommon[temporalio.common.MetricGauge],
+):
     def set(
         self,
         value: int,
@@ -2519,9 +2726,71 @@ class _ReplaySafeMetricGauge(temporalio.common.MetricGauge):
         if not temporalio.workflow.unsafe.is_replaying():
             self._underlying.set(value, additional_attributes)
 
-    def with_additional_attributes(
-        self, additional_attributes: temporalio.common.MetricAttributes
-    ) -> temporalio.common.MetricGauge:
-        return _ReplaySafeMetricGauge(
-            self._underlying.with_additional_attributes(additional_attributes)
+
+class _ReplaySafeMetricGaugeFloat(
+    temporalio.common.MetricGaugeFloat,
+    _ReplaySafeMetricCommon[temporalio.common.MetricGaugeFloat],
+):
+    def set(
+        self,
+        value: float,
+        additional_attributes: Optional[temporalio.common.MetricAttributes] = None,
+    ) -> None:
+        if not temporalio.workflow.unsafe.is_replaying():
+            self._underlying.set(value, additional_attributes)
+
+
+class _WorkflowBeingEvictedError(BaseException):
+    pass
+
+
+@dataclass
+class HandlerExecution:
+    """Information about an execution of a signal or update handler."""
+
+    name: str
+    unfinished_policy: temporalio.workflow.HandlerUnfinishedPolicy
+    id: Optional[str] = None
+
+
+def _make_unfinished_update_handler_message(
+    handler_executions: List[HandlerExecution],
+) -> str:
+    message = """
+Workflow finished while update handlers are still running. This may have interrupted work that the
+update handler was doing, and the client that sent the update will receive a 'workflow execution
+already completed' RPCError instead of the update result. You can wait for all update and signal
+handlers to complete by using `await workflow.wait_condition(lambda:
+workflow.all_handlers_finished())`. Alternatively, if both you and the clients sending the update
+are okay with interrupting running handlers when the workflow finishes, and causing clients to
+receive errors, then you can disable this warning via the update handler decorator:
+`@workflow.update(unfinished_policy=workflow.HandlerUnfinishedPolicy.ABANDON)`.
+""".replace(
+        "\n", " "
+    ).strip()
+    return (
+        f"{message} The following updates were unfinished (and warnings were not disabled for their handler): "
+        + json.dumps([{"name": ex.name, "id": ex.id} for ex in handler_executions])
+    )
+
+
+def _make_unfinished_signal_handler_message(
+    handler_executions: List[HandlerExecution],
+) -> str:
+    message = """
+Workflow finished while signal handlers are still running. This may have interrupted work that the
+signal handler was doing. You can wait for all update and signal handlers to complete by using
+`await workflow.wait_condition(lambda: workflow.all_handlers_finished())`. Alternatively, if both
+you and the clients sending the signal are okay with interrupting running handlers when the workflow
+finishes, and causing clients to receive errors, then you can disable this warning via the signal
+handler decorator: `@workflow.signal(unfinished_policy=workflow.HandlerUnfinishedPolicy.ABANDON)`.
+""".replace(
+        "\n", " "
+    ).strip()
+    names = collections.Counter(ex.name for ex in handler_executions)
+    return (
+        f"{message} The following signals were unfinished (and warnings were not disabled for their handler): "
+        + json.dumps(
+            [{"name": name, "count": count} for name, count in names.most_common()]
         )
+    )

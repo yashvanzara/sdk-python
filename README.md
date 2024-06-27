@@ -61,7 +61,8 @@ informal introduction to the features and their implementation.
       - [Invoking Child Workflows](#invoking-child-workflows)
       - [Timers](#timers)
       - [Conditions](#conditions)
-      - [Asyncio and Cancellation](#asyncio-and-cancellation)
+      - [Asyncio and Determinism](#asyncio-and-determinism)
+      - [Asyncio Cancellation](#asyncio-cancellation)
       - [Workflow Utilities](#workflow-utilities)
       - [Exceptions](#exceptions)
       - [External Workflows](#external-workflows)
@@ -550,8 +551,9 @@ Some things to note about the above workflow code:
 * This workflow continually updates the queryable current greeting when signalled and can complete with the greeting on
   a different signal
 * Workflows are always classes and must have a single `@workflow.run` which is an `async def` function
-* Workflow code must be deterministic. This means no threading, no randomness, no external calls to processes, no
-  network IO, and no global state mutation. All code must run in the implicit `asyncio` event loop and be deterministic.
+* Workflow code must be deterministic. This means no `set` iteration, threading, no randomness, no external calls to
+  processes, no network IO, and no global state mutation. All code must run in the implicit `asyncio` event loop and be
+  deterministic. Also see the [Asyncio and Determinism](#asyncio-and-determinism) section later.
 * `@activity.defn` is explained in a later section. For normal simple string concatenation, this would just be done in
   the workflow. The activity is for demonstration purposes only.
 * `workflow.execute_activity(create_greeting_activity, ...` is actually a typed signature, and MyPy will fail if the
@@ -678,15 +680,25 @@ Some things to note about the above code:
 * A `timeout` can optionally be provided which will throw a `asyncio.TimeoutError` if reached (internally backed by
   `asyncio.wait_for` which uses a timer)
 
-#### Asyncio and Cancellation
+#### Asyncio and Determinism
 
-Workflows are backed by a custom [asyncio](https://docs.python.org/3/library/asyncio.html) event loop. This means many
-of the common `asyncio` calls work as normal. Some asyncio features are disabled such as:
+Workflows must be deterministic. Workflows are backed by a custom
+[asyncio](https://docs.python.org/3/library/asyncio.html) event loop. This means many of the common `asyncio` calls work
+as normal. Some asyncio features are disabled such as:
 
 * Thread related calls such as `to_thread()`, `run_coroutine_threadsafe()`, `loop.run_in_executor()`, etc
 * Calls that alter the event loop such as `loop.close()`, `loop.stop()`, `loop.run_forever()`,
   `loop.set_task_factory()`, etc
 * Calls that use anything external such as networking, subprocesses, disk IO, etc
+
+Also, there are some `asyncio` utilities that internally use `set()` which can make them non-deterministic from one
+worker to the next. Therefore the following `asyncio` functions have `workflow`-module alternatives that are
+deterministic:
+
+* `asyncio.as_completed()` - use `workflow.as_completed()`
+* `asyncio.wait()` - use `workflow.wait()`
+
+#### Asyncio Cancellation
 
 Cancellation is done the same way as `asyncio`. Specifically, a task can be requested to be cancelled but does not
 necessarily have to respect that cancellation immediately. This also means that `asyncio.shield()` can be used to
@@ -722,7 +734,8 @@ While running in a workflow, in addition to features documented elsewhere, the f
 
 #### Exceptions
 
-* Workflows can raise exceptions to fail the workflow or the "workflow task" (i.e. suspend the workflow retrying).
+* Workflows/updates can raise exceptions to fail the workflow or the "workflow task" (i.e. suspend the workflow
+  in a retrying state).
 * Exceptions that are instances of `temporalio.exceptions.FailureError` will fail the workflow with that exception
   * For failing the workflow explicitly with a user exception, use `temporalio.exceptions.ApplicationError`. This can
     be marked non-retryable or include details as needed.
@@ -731,6 +744,13 @@ While running in a workflow, in addition to features documented elsewhere, the f
 * All other exceptions fail the "workflow task" which means the workflow will continually retry until the workflow is
   fixed. This is helpful for bad code or other non-predictable exceptions. To actually fail the workflow, use an
   `ApplicationError` as mentioned above.
+
+This default can be changed by providing a list of exception types to `workflow_failure_exception_types` when creating a
+`Worker` or `failure_exception_types` on the `@workflow.defn` decorator. If a workflow-thrown exception is an instance
+of any type in either list, it will fail the workflow instead of the task. This means a value of `[Exception]` will
+cause every exception to fail the workflow instead of the task. Also, as a special case, if
+`temporalio.workflow.NondeterminismError` (or any superclass of it) is set, non-deterministic exceptions will fail the
+workflow. WARNING: These settings are experimental.
 
 #### External Workflows
 
@@ -1309,6 +1329,7 @@ To build the SDK from source for use as a dependency, the following prerequisite
 * [Python](https://www.python.org/) >= 3.8
   * Make sure the latest version of `pip` is in use
 * [Rust](https://www.rust-lang.org/)
+* [Protobuf Compiler](https://protobuf.dev/)
 * [poetry](https://github.com/python-poetry/poetry) (e.g. `python -m pip install poetry`)
 * [poe](https://github.com/nat-n/poethepoet) (e.g. `python -m pip install poethepoet`)
 
@@ -1457,10 +1478,10 @@ to `1` prior to running tests.
 Do not commit `poetry.lock` or `pyproject.toml` changes. To go back from this downgrade, restore `pyproject.toml` and
 run `poetry update protobuf grpcio-tools`.
 
-For a less system-intrusive approach, you can:
+For a less system-intrusive approach, you can (note this approach [may have a bug](https://github.com/temporalio/sdk-python/issues/543)):
 ```shell
 docker build -f scripts/_proto/Dockerfile .
-docker run -v "${PWD}/temporalio/api:/api_new" -v "${PWD}/temporalio/bridge/proto:/bridge_new" <just built image sha>
+docker run --rm -v "${PWD}/temporalio/api:/api_new" -v "${PWD}/temporalio/bridge/proto:/bridge_new" <just built image sha>
 poe format
 ```
 

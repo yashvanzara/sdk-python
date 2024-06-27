@@ -1,7 +1,6 @@
 use futures::channel::mpsc::Receiver;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::AsPyPointer;
 use pythonize::pythonize;
 use std::collections::HashMap;
 use std::future::Future;
@@ -205,7 +204,11 @@ impl Drop for Runtime {
 
 #[pymethods]
 impl RuntimeRef {
-    fn retrieve_buffered_metrics<'p>(&self, py: Python<'p>) -> Vec<BufferedMetricUpdate> {
+    fn retrieve_buffered_metrics<'p>(
+        &self,
+        py: Python<'p>,
+        durations_as_seconds: bool,
+    ) -> Vec<BufferedMetricUpdate> {
         convert_metric_events(
             py,
             self.runtime
@@ -213,6 +216,7 @@ impl RuntimeRef {
                 .as_ref()
                 .expect("Attempting to retrieve buffered metrics without buffer")
                 .retrieve(),
+            durations_as_seconds,
         )
     }
 

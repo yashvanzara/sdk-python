@@ -6,7 +6,18 @@ Nothing in this module should be considered stable. The API may change.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Awaitable, Callable, List, Optional, Sequence, Tuple
+from datetime import timedelta
+from typing import (
+    TYPE_CHECKING,
+    Awaitable,
+    Callable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 import google.protobuf.internal.containers
 from typing_extensions import TypeAlias
@@ -34,9 +45,7 @@ class WorkerConfig:
     build_id: str
     identity_override: Optional[str]
     max_cached_workflows: int
-    max_outstanding_workflow_tasks: int
-    max_outstanding_activities: int
-    max_outstanding_local_activities: int
+    tuner: TunerHolder
     max_concurrent_workflow_task_polls: int
     nonsticky_to_sticky_poll_ratio: float
     max_concurrent_activity_task_polls: int
@@ -48,6 +57,45 @@ class WorkerConfig:
     max_task_queue_activities_per_second: Optional[float]
     graceful_shutdown_period_millis: int
     use_worker_versioning: bool
+    nondeterminism_as_workflow_fail: bool
+    nondeterminism_as_workflow_fail_for_types: Set[str]
+
+
+@dataclass
+class ResourceBasedTunerConfig:
+    """Python representation of the Rust struct for configuring a resource-based tuner."""
+
+    target_memory_usage: float
+    target_cpu_usage: float
+
+
+@dataclass
+class ResourceBasedSlotSupplier:
+    """Python representation of the Rust struct for a resource-based slot supplier."""
+
+    minimum_slots: int
+    maximum_slots: int
+    ramp_throttle_ms: int
+    tuner_config: ResourceBasedTunerConfig
+
+
+@dataclass(frozen=True)
+class FixedSizeSlotSupplier:
+    """Python representation of the Rust struct for a fixed-size slot supplier."""
+
+    num_slots: int
+
+
+SlotSupplier: TypeAlias = Union[FixedSizeSlotSupplier, ResourceBasedSlotSupplier]
+
+
+@dataclass
+class TunerHolder:
+    """Python representation of the Rust struct for a tuner holder."""
+
+    workflow_slot_supplier: SlotSupplier
+    activity_slot_supplier: SlotSupplier
+    local_activity_slot_supplier: SlotSupplier
 
 
 class Worker:
@@ -79,6 +127,10 @@ class Worker:
     def __init__(self, ref: temporalio.bridge.temporal_sdk_bridge.WorkerRef) -> None:
         """Create SDK core worker from a bridge worker."""
         self._ref = ref
+
+    async def validate(self) -> None:
+        """Validate the bridge worker."""
+        await self._ref.validate()
 
     async def poll_workflow_activation(
         self,
@@ -121,6 +173,10 @@ class Worker:
         """Request a workflow be evicted."""
         self._ref.request_workflow_eviction(run_id)
 
+    def replace_client(self, client: temporalio.bridge.client.Client) -> None:
+        """Replace the worker client."""
+        self._ref.replace_client(client._ref)
+
     def initiate_shutdown(self) -> None:
         """Start shutdown of the worker."""
         self._ref.initiate_shutdown()
@@ -160,6 +216,8 @@ async def _apply_to_payloads(
     if len(payloads) == 0:
         return
     new_payloads = await cb(payloads)
+    if new_payloads is payloads:
+        return
     del payloads[:]
     # TODO(cretz): Copy too expensive?
     payloads.extend(new_payloads)
@@ -174,9 +232,7 @@ async def _apply_to_payload(
 ) -> None:
     """Apply API payload callback to payload."""
     new_payload = (await cb([payload]))[0]
-    payload.metadata.clear()
-    payload.metadata.update(new_payload.metadata)
-    payload.data = new_payload.data
+    payload.CopyFrom(new_payload)
 
 
 async def _decode_payloads(

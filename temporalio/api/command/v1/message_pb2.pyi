@@ -34,6 +34,7 @@ import temporalio.api.common.v1.message_pb2
 import temporalio.api.enums.v1.command_type_pb2
 import temporalio.api.enums.v1.workflow_pb2
 import temporalio.api.failure.v1.message_pb2
+import temporalio.api.sdk.v1.user_metadata_pb2
 import temporalio.api.taskqueue.v1.message_pb2
 
 if sys.version_info >= (3, 8):
@@ -57,7 +58,7 @@ class ScheduleActivityTaskCommandAttributes(google.protobuf.message.Message):
     HEARTBEAT_TIMEOUT_FIELD_NUMBER: builtins.int
     RETRY_POLICY_FIELD_NUMBER: builtins.int
     REQUEST_EAGER_EXECUTION_FIELD_NUMBER: builtins.int
-    USE_COMPATIBLE_VERSION_FIELD_NUMBER: builtins.int
+    USE_WORKFLOW_BUILD_ID_FIELD_NUMBER: builtins.int
     activity_id: builtins.str
     @property
     def activity_type(self) -> temporalio.api.common.v1.message_pb2.ActivityType: ...
@@ -111,10 +112,9 @@ class ScheduleActivityTaskCommandAttributes(google.protobuf.message.Message):
     """Request to start the activity directly bypassing matching service and worker polling
     The slot for executing the activity should be reserved when setting this field to true.
     """
-    use_compatible_version: builtins.bool
-    """If this is set, the workflow executing this command wishes to start the activity using
-    a version compatible with the version that this workflow most recently ran on, if such
-    behavior is possible.
+    use_workflow_build_id: builtins.bool
+    """If this is set, the activity would be assigned to the Build ID of the workflow. Otherwise,
+    Assignment rules of the activity's Task Queue will be used to determine the Build ID.
     """
     def __init__(
         self,
@@ -130,7 +130,7 @@ class ScheduleActivityTaskCommandAttributes(google.protobuf.message.Message):
         heartbeat_timeout: google.protobuf.duration_pb2.Duration | None = ...,
         retry_policy: temporalio.api.common.v1.message_pb2.RetryPolicy | None = ...,
         request_eager_execution: builtins.bool = ...,
-        use_compatible_version: builtins.bool = ...,
+        use_workflow_build_id: builtins.bool = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -180,8 +180,8 @@ class ScheduleActivityTaskCommandAttributes(google.protobuf.message.Message):
             b"start_to_close_timeout",
             "task_queue",
             b"task_queue",
-            "use_compatible_version",
-            b"use_compatible_version",
+            "use_workflow_build_id",
+            b"use_workflow_build_id",
         ],
     ) -> None: ...
 
@@ -600,7 +600,7 @@ class ContinueAsNewWorkflowExecutionCommandAttributes(google.protobuf.message.Me
     HEADER_FIELD_NUMBER: builtins.int
     MEMO_FIELD_NUMBER: builtins.int
     SEARCH_ATTRIBUTES_FIELD_NUMBER: builtins.int
-    USE_COMPATIBLE_VERSION_FIELD_NUMBER: builtins.int
+    INHERIT_BUILD_ID_FIELD_NUMBER: builtins.int
     @property
     def workflow_type(self) -> temporalio.api.common.v1.message_pb2.WorkflowType: ...
     @property
@@ -636,9 +636,9 @@ class ContinueAsNewWorkflowExecutionCommandAttributes(google.protobuf.message.Me
     def search_attributes(
         self,
     ) -> temporalio.api.common.v1.message_pb2.SearchAttributes: ...
-    use_compatible_version: builtins.bool
-    """If this is set, the workflow executing this command wishes to continue as new using a version
-    compatible with the version that this workflow most recently ran on.
+    inherit_build_id: builtins.bool
+    """If this is set, the new execution inherits the Build ID of the current execution. Otherwise,
+    the assignment rules will be used to independently assign a Build ID to the new execution.
     """
     def __init__(
         self,
@@ -659,7 +659,7 @@ class ContinueAsNewWorkflowExecutionCommandAttributes(google.protobuf.message.Me
         memo: temporalio.api.common.v1.message_pb2.Memo | None = ...,
         search_attributes: temporalio.api.common.v1.message_pb2.SearchAttributes
         | None = ...,
-        use_compatible_version: builtins.bool = ...,
+        inherit_build_id: builtins.bool = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -701,6 +701,8 @@ class ContinueAsNewWorkflowExecutionCommandAttributes(google.protobuf.message.Me
             b"failure",
             "header",
             b"header",
+            "inherit_build_id",
+            b"inherit_build_id",
             "initiator",
             b"initiator",
             "input",
@@ -715,8 +717,6 @@ class ContinueAsNewWorkflowExecutionCommandAttributes(google.protobuf.message.Me
             b"search_attributes",
             "task_queue",
             b"task_queue",
-            "use_compatible_version",
-            b"use_compatible_version",
             "workflow_run_timeout",
             b"workflow_run_timeout",
             "workflow_task_timeout",
@@ -749,7 +749,7 @@ class StartChildWorkflowExecutionCommandAttributes(google.protobuf.message.Messa
     HEADER_FIELD_NUMBER: builtins.int
     MEMO_FIELD_NUMBER: builtins.int
     SEARCH_ATTRIBUTES_FIELD_NUMBER: builtins.int
-    USE_COMPATIBLE_VERSION_FIELD_NUMBER: builtins.int
+    INHERIT_BUILD_ID_FIELD_NUMBER: builtins.int
     namespace: builtins.str
     workflow_id: builtins.str
     @property
@@ -784,10 +784,9 @@ class StartChildWorkflowExecutionCommandAttributes(google.protobuf.message.Messa
     def search_attributes(
         self,
     ) -> temporalio.api.common.v1.message_pb2.SearchAttributes: ...
-    use_compatible_version: builtins.bool
-    """If this is set, the workflow executing this command wishes to start the child workflow using
-    a version compatible with the version that this workflow most recently ran on, if such
-    behavior is possible.
+    inherit_build_id: builtins.bool
+    """If this is set, the child workflow inherits the Build ID of the parent. Otherwise, the assignment
+    rules of the child's Task Queue will be used to independently assign a Build ID to it.
     """
     def __init__(
         self,
@@ -809,7 +808,7 @@ class StartChildWorkflowExecutionCommandAttributes(google.protobuf.message.Messa
         memo: temporalio.api.common.v1.message_pb2.Memo | None = ...,
         search_attributes: temporalio.api.common.v1.message_pb2.SearchAttributes
         | None = ...,
-        use_compatible_version: builtins.bool = ...,
+        inherit_build_id: builtins.bool = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -845,6 +844,8 @@ class StartChildWorkflowExecutionCommandAttributes(google.protobuf.message.Messa
             b"cron_schedule",
             "header",
             b"header",
+            "inherit_build_id",
+            b"inherit_build_id",
             "input",
             b"input",
             "memo",
@@ -859,8 +860,6 @@ class StartChildWorkflowExecutionCommandAttributes(google.protobuf.message.Messa
             b"search_attributes",
             "task_queue",
             b"task_queue",
-            "use_compatible_version",
-            b"use_compatible_version",
             "workflow_execution_timeout",
             b"workflow_execution_timeout",
             "workflow_id",
@@ -897,10 +896,131 @@ class ProtocolMessageCommandAttributes(google.protobuf.message.Message):
 
 global___ProtocolMessageCommandAttributes = ProtocolMessageCommandAttributes
 
+class ScheduleNexusOperationCommandAttributes(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    class NexusHeaderEntry(google.protobuf.message.Message):
+        DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+        KEY_FIELD_NUMBER: builtins.int
+        VALUE_FIELD_NUMBER: builtins.int
+        key: builtins.str
+        value: builtins.str
+        def __init__(
+            self,
+            *,
+            key: builtins.str = ...,
+            value: builtins.str = ...,
+        ) -> None: ...
+        def ClearField(
+            self,
+            field_name: typing_extensions.Literal["key", b"key", "value", b"value"],
+        ) -> None: ...
+
+    ENDPOINT_FIELD_NUMBER: builtins.int
+    SERVICE_FIELD_NUMBER: builtins.int
+    OPERATION_FIELD_NUMBER: builtins.int
+    INPUT_FIELD_NUMBER: builtins.int
+    SCHEDULE_TO_CLOSE_TIMEOUT_FIELD_NUMBER: builtins.int
+    NEXUS_HEADER_FIELD_NUMBER: builtins.int
+    endpoint: builtins.str
+    """Endpoint name, must exist in the endpoint registry or this command will fail."""
+    service: builtins.str
+    """Service name."""
+    operation: builtins.str
+    """Operation name."""
+    @property
+    def input(self) -> temporalio.api.common.v1.message_pb2.Payload:
+        """Input for the operation. The server converts this into Nexus request content and the appropriate content headers
+        internally when sending the StartOperation request. On the handler side, if it is also backed by Temporal, the
+        content is transformed back to the original Payload sent in this command.
+        """
+    @property
+    def schedule_to_close_timeout(self) -> google.protobuf.duration_pb2.Duration:
+        """Schedule-to-close timeout for this operation.
+        Indicates how long the caller is willing to wait for operation completion.
+        Calls are retried internally by the server.
+        (-- api-linter: core::0140::prepositions=disabled
+            aip.dev/not-precedent: "to" is used to indicate interval. --)
+        """
+    @property
+    def nexus_header(
+        self,
+    ) -> google.protobuf.internal.containers.ScalarMap[builtins.str, builtins.str]:
+        """Header to attach to the Nexus request.
+        Users are responsible for encrypting sensitive data in this header as it is stored in workflow history and
+        transmitted to external services as-is.
+        This is useful for propagating tracing information.
+        Note these headers are not the same as Temporal headers on internal activities and child workflows, these are
+        transmitted to Nexus operations that may be external and are not traditional payloads.
+        """
+    def __init__(
+        self,
+        *,
+        endpoint: builtins.str = ...,
+        service: builtins.str = ...,
+        operation: builtins.str = ...,
+        input: temporalio.api.common.v1.message_pb2.Payload | None = ...,
+        schedule_to_close_timeout: google.protobuf.duration_pb2.Duration | None = ...,
+        nexus_header: collections.abc.Mapping[builtins.str, builtins.str] | None = ...,
+    ) -> None: ...
+    def HasField(
+        self,
+        field_name: typing_extensions.Literal[
+            "input", b"input", "schedule_to_close_timeout", b"schedule_to_close_timeout"
+        ],
+    ) -> builtins.bool: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "endpoint",
+            b"endpoint",
+            "input",
+            b"input",
+            "nexus_header",
+            b"nexus_header",
+            "operation",
+            b"operation",
+            "schedule_to_close_timeout",
+            b"schedule_to_close_timeout",
+            "service",
+            b"service",
+        ],
+    ) -> None: ...
+
+global___ScheduleNexusOperationCommandAttributes = (
+    ScheduleNexusOperationCommandAttributes
+)
+
+class RequestCancelNexusOperationCommandAttributes(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    SCHEDULED_EVENT_ID_FIELD_NUMBER: builtins.int
+    scheduled_event_id: builtins.int
+    """The `NEXUS_OPERATION_SCHEDULED` event ID (a unique identifier) for the operation to be canceled.
+    The operation may ignore cancellation and end up with any completion state.
+    """
+    def __init__(
+        self,
+        *,
+        scheduled_event_id: builtins.int = ...,
+    ) -> None: ...
+    def ClearField(
+        self,
+        field_name: typing_extensions.Literal[
+            "scheduled_event_id", b"scheduled_event_id"
+        ],
+    ) -> None: ...
+
+global___RequestCancelNexusOperationCommandAttributes = (
+    RequestCancelNexusOperationCommandAttributes
+)
+
 class Command(google.protobuf.message.Message):
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
 
     COMMAND_TYPE_FIELD_NUMBER: builtins.int
+    USER_METADATA_FIELD_NUMBER: builtins.int
     SCHEDULE_ACTIVITY_TASK_COMMAND_ATTRIBUTES_FIELD_NUMBER: builtins.int
     START_TIMER_COMMAND_ATTRIBUTES_FIELD_NUMBER: builtins.int
     COMPLETE_WORKFLOW_EXECUTION_COMMAND_ATTRIBUTES_FIELD_NUMBER: builtins.int
@@ -916,7 +1036,22 @@ class Command(google.protobuf.message.Message):
     UPSERT_WORKFLOW_SEARCH_ATTRIBUTES_COMMAND_ATTRIBUTES_FIELD_NUMBER: builtins.int
     PROTOCOL_MESSAGE_COMMAND_ATTRIBUTES_FIELD_NUMBER: builtins.int
     MODIFY_WORKFLOW_PROPERTIES_COMMAND_ATTRIBUTES_FIELD_NUMBER: builtins.int
+    SCHEDULE_NEXUS_OPERATION_COMMAND_ATTRIBUTES_FIELD_NUMBER: builtins.int
+    REQUEST_CANCEL_NEXUS_OPERATION_COMMAND_ATTRIBUTES_FIELD_NUMBER: builtins.int
     command_type: temporalio.api.enums.v1.command_type_pb2.CommandType.ValueType
+    @property
+    def user_metadata(self) -> temporalio.api.sdk.v1.user_metadata_pb2.UserMetadata:
+        """Metadata on the command. This is sometimes carried over to the history event if one is
+        created as a result of the command. Most commands won't have this information, and how this
+        information is used is dependent upon the interface that reads it.
+
+        Current well-known uses:
+         * start_child_workflow_execution_command_attributes - populates
+           temporalio.api.workflow.v1.WorkflowExecutionInfo.user_metadata where the summary and details
+           are used by user interfaces to show fixed as-of-start workflow summary and details.
+         * start_timer_command_attributes - populates temporalio.api.history.v1.HistoryEvent for timer
+           started where the summary is used to identify the timer.
+        """
     @property
     def schedule_activity_task_command_attributes(
         self,
@@ -978,10 +1113,20 @@ class Command(google.protobuf.message.Message):
         self,
     ) -> global___ModifyWorkflowPropertiesCommandAttributes:
         """16 is available for use - it was used as part of a prototype that never made it into a release"""
+    @property
+    def schedule_nexus_operation_command_attributes(
+        self,
+    ) -> global___ScheduleNexusOperationCommandAttributes: ...
+    @property
+    def request_cancel_nexus_operation_command_attributes(
+        self,
+    ) -> global___RequestCancelNexusOperationCommandAttributes: ...
     def __init__(
         self,
         *,
         command_type: temporalio.api.enums.v1.command_type_pb2.CommandType.ValueType = ...,
+        user_metadata: temporalio.api.sdk.v1.user_metadata_pb2.UserMetadata
+        | None = ...,
         schedule_activity_task_command_attributes: global___ScheduleActivityTaskCommandAttributes
         | None = ...,
         start_timer_command_attributes: global___StartTimerCommandAttributes
@@ -1012,6 +1157,10 @@ class Command(google.protobuf.message.Message):
         | None = ...,
         modify_workflow_properties_command_attributes: global___ModifyWorkflowPropertiesCommandAttributes
         | None = ...,
+        schedule_nexus_operation_command_attributes: global___ScheduleNexusOperationCommandAttributes
+        | None = ...,
+        request_cancel_nexus_operation_command_attributes: global___RequestCancelNexusOperationCommandAttributes
+        | None = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -1038,8 +1187,12 @@ class Command(google.protobuf.message.Message):
             b"request_cancel_activity_task_command_attributes",
             "request_cancel_external_workflow_execution_command_attributes",
             b"request_cancel_external_workflow_execution_command_attributes",
+            "request_cancel_nexus_operation_command_attributes",
+            b"request_cancel_nexus_operation_command_attributes",
             "schedule_activity_task_command_attributes",
             b"schedule_activity_task_command_attributes",
+            "schedule_nexus_operation_command_attributes",
+            b"schedule_nexus_operation_command_attributes",
             "signal_external_workflow_execution_command_attributes",
             b"signal_external_workflow_execution_command_attributes",
             "start_child_workflow_execution_command_attributes",
@@ -1048,6 +1201,8 @@ class Command(google.protobuf.message.Message):
             b"start_timer_command_attributes",
             "upsert_workflow_search_attributes_command_attributes",
             b"upsert_workflow_search_attributes_command_attributes",
+            "user_metadata",
+            b"user_metadata",
         ],
     ) -> builtins.bool: ...
     def ClearField(
@@ -1077,8 +1232,12 @@ class Command(google.protobuf.message.Message):
             b"request_cancel_activity_task_command_attributes",
             "request_cancel_external_workflow_execution_command_attributes",
             b"request_cancel_external_workflow_execution_command_attributes",
+            "request_cancel_nexus_operation_command_attributes",
+            b"request_cancel_nexus_operation_command_attributes",
             "schedule_activity_task_command_attributes",
             b"schedule_activity_task_command_attributes",
+            "schedule_nexus_operation_command_attributes",
+            b"schedule_nexus_operation_command_attributes",
             "signal_external_workflow_execution_command_attributes",
             b"signal_external_workflow_execution_command_attributes",
             "start_child_workflow_execution_command_attributes",
@@ -1087,6 +1246,8 @@ class Command(google.protobuf.message.Message):
             b"start_timer_command_attributes",
             "upsert_workflow_search_attributes_command_attributes",
             b"upsert_workflow_search_attributes_command_attributes",
+            "user_metadata",
+            b"user_metadata",
         ],
     ) -> None: ...
     def WhichOneof(
@@ -1108,6 +1269,8 @@ class Command(google.protobuf.message.Message):
             "upsert_workflow_search_attributes_command_attributes",
             "protocol_message_command_attributes",
             "modify_workflow_properties_command_attributes",
+            "schedule_nexus_operation_command_attributes",
+            "request_cancel_nexus_operation_command_attributes",
         ]
         | None
     ): ...

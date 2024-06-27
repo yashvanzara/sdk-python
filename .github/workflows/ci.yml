@@ -10,10 +10,10 @@ jobs:
   # Build and test the project
   build-lint-test:
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         python: ["3.8", "3.12"]
-        os: [ubuntu-latest, macos-latest, windows-latest, ubuntu-arm]
+        os: [ubuntu-latest, ubuntu-arm, macos-intel, macos-arm, windows-latest]
         include:
           - os: ubuntu-latest
             python: "3.12"
@@ -23,26 +23,40 @@ jobs:
             protoCheckTarget: true
           - os: ubuntu-arm
             runsOn: buildjet-4vcpu-ubuntu-2204-arm
+          - os: macos-intel
+            runsOn: macos-12
+          - os: macos-arm
+            runsOn: macos-14
+        # macOS ARM 3.8 does not have an available Python build at
+        # https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json.
+        # See https://github.com/actions/setup-python/issues/808 and
+        # https://github.com/actions/python-versions/pull/259.
+        exclude:
+          - os: macos-arm
+            python: "3.8"
     runs-on: ${{ matrix.runsOn || matrix.os }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@v1
-        with:
-          working-directory: temporalio/bridge
-      # actions/setup-python doesn't yet support ARM
-      - if: ${{ !endsWith(matrix.os, '-arm') }}
-        uses: actions/setup-python@v4
+          workspaces: temporalio/bridge -> target
+      # actions/setup-python doesn't yet support Linux ARM
+      - if: ${{ matrix.os != 'ubuntu-arm' }}
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - if: ${{ matrix.os == 'ubuntu-arm' }}
-        uses: deadsnakes/action@v2.1.1
+        uses: deadsnakes/action@v3.1.0
         with:
           python-version: ${{ matrix.python }}
+      - uses: arduino/setup-protoc@v3
+        with:
+          # TODO(cretz): Can upgrade proto when https://github.com/arduino/setup-protoc/issues/99 fixed
+          version: "23.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       # Using fixed Poetry version until
       # https://github.com/python-poetry/poetry/issues/7611 and
       # https://github.com/python-poetry/poetry/pull/7694 are fixed
@@ -68,7 +82,7 @@ jobs:
           poetry add "protobuf<4"
           poe gen-protos
           poe format
-          [[ -z $(git status --porcelain temporalio) ]] || (git diff; echo "Protos changed"; exit 1)
+          [[ -z $(git status --porcelain temporalio) ]] || (git diff temporalio; echo "Protos changed"; exit 1)
           poe test -s -o log_cli_level=DEBUG
 
       # Do docs stuff (only on one host)
@@ -80,7 +94,7 @@ jobs:
         run: npx vercel deploy build/apidocs -t ${{ secrets.VERCEL_TOKEN }} --name python --scope temporal --prod --yes
 
       # Confirm README ToC is generated properly
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
       - name: Check generated README ToC
         if: ${{ matrix.docsTarget }}
         run: |
@@ -94,3 +108,4 @@ jobs:
       python-repo-path: ${{github.event.pull_request.head.repo.full_name}}
       version: ${{github.event.pull_request.head.ref}}
       version-is-repo-ref: true
+      features-repo-ref: python-update-updates

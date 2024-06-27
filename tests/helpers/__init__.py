@@ -6,11 +6,14 @@ from contextlib import closing
 from datetime import timedelta
 from typing import Awaitable, Callable, Optional, Sequence, Type, TypeVar
 
+from temporalio.api.common.v1 import WorkflowExecution
 from temporalio.api.enums.v1 import IndexedValueType
 from temporalio.api.operatorservice.v1 import (
     AddSearchAttributesRequest,
     ListSearchAttributesRequest,
 )
+from temporalio.api.update.v1 import UpdateRef
+from temporalio.api.workflowservice.v1 import PollWorkflowExecutionUpdateRequest
 from temporalio.client import BuildIdOpAddNewDefault, Client
 from temporalio.common import SearchAttributeKey
 from temporalio.service import RPCError, RPCStatusCode
@@ -25,6 +28,7 @@ def new_worker(
     task_queue: Optional[str] = None,
     workflow_runner: WorkflowRunner = SandboxedWorkflowRunner(),
     max_cached_workflows: int = 1000,
+    workflow_failure_exception_types: Sequence[Type[BaseException]] = [],
     **kwargs,
 ) -> Worker:
     return Worker(
@@ -34,6 +38,7 @@ def new_worker(
         activities=activities,
         workflow_runner=workflow_runner,
         max_cached_workflows=max_cached_workflows,
+        workflow_failure_exception_types=workflow_failure_exception_types,
         **kwargs,
     )
 
@@ -57,7 +62,7 @@ async def assert_eq_eventually(
         await asyncio.sleep(interval.total_seconds())
     assert (
         expected == last_value
-    ), "timed out waiting for equal, asserted against last value"
+    ), f"timed out waiting for equal, asserted against last value of {last_value}"
 
 
 async def worker_versioning_enabled(client: Client) -> bool:
@@ -103,3 +108,23 @@ def find_free_port() -> int:
         s.bind(("", 0))
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         return s.getsockname()[1]
+
+
+async def workflow_update_exists(
+    client: Client, workflow_id: str, update_id: str
+) -> bool:
+    try:
+        await client.workflow_service.poll_workflow_execution_update(
+            PollWorkflowExecutionUpdateRequest(
+                namespace=client.namespace,
+                update_ref=UpdateRef(
+                    workflow_execution=WorkflowExecution(workflow_id=workflow_id),
+                    update_id=update_id,
+                ),
+            )
+        )
+        return True
+    except RPCError as err:
+        if err.status != RPCStatusCode.NOT_FOUND:
+            raise
+        return False

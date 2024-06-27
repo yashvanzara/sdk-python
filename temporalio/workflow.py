@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import logging
 import threading
@@ -22,6 +23,7 @@ from typing import (
     Callable,
     Dict,
     Generic,
+    Iterable,
     Iterator,
     List,
     Mapping,
@@ -31,6 +33,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    TypeVar,
     Union,
     cast,
     overload,
@@ -83,7 +86,10 @@ def defn(cls: ClassType) -> ClassType:
 
 @overload
 def defn(
-    *, name: Optional[str] = None, sandboxed: bool = True
+    *,
+    name: Optional[str] = None,
+    sandboxed: bool = True,
+    failure_exception_types: Sequence[Type[BaseException]] = [],
 ) -> Callable[[ClassType], ClassType]:
     ...
 
@@ -101,6 +107,7 @@ def defn(
     name: Optional[str] = None,
     sandboxed: bool = True,
     dynamic: bool = False,
+    failure_exception_types: Sequence[Type[BaseException]] = [],
 ):
     """Decorator for workflow classes.
 
@@ -116,6 +123,12 @@ def defn(
         dynamic: If true, this activity will be dynamic. Dynamic workflows have
             to accept a single 'Sequence[RawValue]' parameter. This cannot be
             set to true if name is present.
+        failure_exception_types: The types of exceptions that, if a
+            workflow-thrown exception extends, will cause the workflow/update to
+            fail instead of suspending the workflow via task failure. These are
+            applied in addition to ones set on the worker constructor. If
+            ``Exception`` is set, it effectively will fail a workflow/update in
+            all user exception cases. WARNING: This setting is experimental.
     """
 
     def decorator(cls: ClassType) -> ClassType:
@@ -124,6 +137,7 @@ def defn(
             cls,
             workflow_name=name or cls.__name__ if not dynamic else None,
             sandboxed=sandboxed,
+            failure_exception_types=failure_exception_types,
         )
         return cls
 
@@ -159,6 +173,30 @@ def run(fn: CallableAsyncType) -> CallableAsyncType:
     return fn  # type: ignore[return-value]
 
 
+class HandlerUnfinishedPolicy(Enum):
+    """Actions taken if a workflow terminates with running handlers.
+
+    Policy defining actions taken when a workflow exits while update or signal handlers are running.
+    The workflow exit may be due to successful return, failure, cancellation, or continue-as-new.
+    """
+
+    WARN_AND_ABANDON = 1
+    """Issue a warning in addition to abandoning."""
+    ABANDON = 2
+    """Abandon the handler.
+
+    In the case of an update handler this means that the client will receive an error rather than
+    the update result."""
+
+
+class UnfinishedUpdateHandlersWarning(RuntimeWarning):
+    """The workflow exited before all update handlers had finished executing."""
+
+
+class UnfinishedSignalHandlersWarning(RuntimeWarning):
+    """The workflow exited before all signal handlers had finished executing."""
+
+
 @overload
 def signal(fn: CallableSyncOrAsyncReturnNoneType) -> CallableSyncOrAsyncReturnNoneType:
     ...
@@ -166,14 +204,26 @@ def signal(fn: CallableSyncOrAsyncReturnNoneType) -> CallableSyncOrAsyncReturnNo
 
 @overload
 def signal(
-    *, name: str
+    *,
+    unfinished_policy: HandlerUnfinishedPolicy = HandlerUnfinishedPolicy.WARN_AND_ABANDON,
 ) -> Callable[[CallableSyncOrAsyncReturnNoneType], CallableSyncOrAsyncReturnNoneType]:
     ...
 
 
 @overload
 def signal(
-    *, dynamic: Literal[True]
+    *,
+    name: str,
+    unfinished_policy: HandlerUnfinishedPolicy = HandlerUnfinishedPolicy.WARN_AND_ABANDON,
+) -> Callable[[CallableSyncOrAsyncReturnNoneType], CallableSyncOrAsyncReturnNoneType]:
+    ...
+
+
+@overload
+def signal(
+    *,
+    dynamic: Literal[True],
+    unfinished_policy: HandlerUnfinishedPolicy = HandlerUnfinishedPolicy.WARN_AND_ABANDON,
 ) -> Callable[[CallableSyncOrAsyncReturnNoneType], CallableSyncOrAsyncReturnNoneType]:
     ...
 
@@ -183,6 +233,7 @@ def signal(
     *,
     name: Optional[str] = None,
     dynamic: Optional[bool] = False,
+    unfinished_policy: HandlerUnfinishedPolicy = HandlerUnfinishedPolicy.WARN_AND_ABANDON,
 ):
     """Decorator for a workflow signal method.
 
@@ -203,12 +254,23 @@ def signal(
             parameters of the method must be self, a string name, and a
             ``*args`` positional varargs. Cannot be present when ``name`` is
             present.
+        unfinished_policy: Actions taken if a workflow terminates with
+            a running instance of this handler.
     """
 
-    def with_name(
-        name: Optional[str], fn: CallableSyncOrAsyncReturnNoneType
+    def decorator(
+        name: Optional[str],
+        unfinished_policy: HandlerUnfinishedPolicy,
+        fn: CallableSyncOrAsyncReturnNoneType,
     ) -> CallableSyncOrAsyncReturnNoneType:
-        defn = _SignalDefinition(name=name, fn=fn, is_method=True)
+        if not name and not dynamic:
+            name = fn.__name__
+        defn = _SignalDefinition(
+            name=name,
+            fn=fn,
+            is_method=True,
+            unfinished_policy=unfinished_policy,
+        )
         setattr(fn, "__temporal_signal_definition", defn)
         if defn.dynamic_vararg:
             warnings.warn(
@@ -218,13 +280,12 @@ def signal(
             )
         return fn
 
-    if name is not None or dynamic:
+    if not fn:
         if name is not None and dynamic:
             raise RuntimeError("Cannot provide name and dynamic boolean")
-        return partial(with_name, name)
-    if fn is None:
-        raise RuntimeError("Cannot create signal without function or name or dynamic")
-    return with_name(fn.__name__, fn)
+        return partial(decorator, name, unfinished_policy)
+    else:
+        return decorator(fn.__name__, unfinished_policy, fn)
 
 
 @overload
@@ -411,6 +472,17 @@ class ParentInfo:
     workflow_id: str
 
 
+@dataclass(frozen=True)
+class UpdateInfo:
+    """Information about a workflow update."""
+
+    id: str
+    """Update ID."""
+
+    name: str
+    """Update type name."""
+
+
 class _Runtime(ABC):
     @staticmethod
     def current() -> _Runtime:
@@ -441,6 +513,10 @@ class _Runtime(ABC):
         if self._logger_details is None:
             self._logger_details = self.workflow_info()._logger_details()
         return self._logger_details
+
+    @abstractmethod
+    def workflow_all_handlers_finished(self) -> bool:
+        ...
 
     @abstractmethod
     def workflow_continue_as_new(
@@ -639,6 +715,31 @@ class _Runtime(ABC):
         self, fn: Callable[[], bool], *, timeout: Optional[float] = None
     ) -> None:
         ...
+
+
+_current_update_info: contextvars.ContextVar[UpdateInfo] = contextvars.ContextVar(
+    "__temporal_current_update_info"
+)
+
+
+def _set_current_update_info(info: UpdateInfo) -> None:
+    _current_update_info.set(info)
+
+
+def current_update_info() -> Optional[UpdateInfo]:
+    """Info for the current update if any.
+
+    This is powered by :py:mod:`contextvars` so it is only valid within the
+    update handler and coroutines/tasks it has started.
+
+    .. warning::
+       This API is experimental
+
+    Returns:
+        Info for the current update handler the code calling this is executing
+            within if any.
+    """
+    return _current_update_info.get(None)
 
 
 def deprecate_patch(id: str) -> None:
@@ -873,7 +974,8 @@ def update(
 
 @overload
 def update(
-    *, name: str
+    *,
+    unfinished_policy: HandlerUnfinishedPolicy = HandlerUnfinishedPolicy.WARN_AND_ABANDON,
 ) -> Callable[
     [Callable[MultiParamSpec, ReturnType]],
     UpdateMethodMultiParam[MultiParamSpec, ReturnType],
@@ -883,7 +985,21 @@ def update(
 
 @overload
 def update(
-    *, dynamic: Literal[True]
+    *,
+    name: str,
+    unfinished_policy: HandlerUnfinishedPolicy = HandlerUnfinishedPolicy.WARN_AND_ABANDON,
+) -> Callable[
+    [Callable[MultiParamSpec, ReturnType]],
+    UpdateMethodMultiParam[MultiParamSpec, ReturnType],
+]:
+    ...
+
+
+@overload
+def update(
+    *,
+    dynamic: Literal[True],
+    unfinished_policy: HandlerUnfinishedPolicy = HandlerUnfinishedPolicy.WARN_AND_ABANDON,
 ) -> Callable[
     [Callable[MultiParamSpec, ReturnType]],
     UpdateMethodMultiParam[MultiParamSpec, ReturnType],
@@ -896,6 +1012,7 @@ def update(
     *,
     name: Optional[str] = None,
     dynamic: Optional[bool] = False,
+    unfinished_policy: HandlerUnfinishedPolicy = HandlerUnfinishedPolicy.WARN_AND_ABANDON,
 ):
     """Decorator for a workflow update handler method.
 
@@ -923,12 +1040,23 @@ def update(
             parameters of the method must be self, a string name, and a
             ``*args`` positional varargs. Cannot be present when ``name`` is
             present.
+        unfinished_policy: Actions taken if a workflow terminates with
+            a running instance of this handler.
     """
 
-    def with_name(
-        name: Optional[str], fn: CallableSyncOrAsyncType
+    def decorator(
+        name: Optional[str],
+        unfinished_policy: HandlerUnfinishedPolicy,
+        fn: CallableSyncOrAsyncType,
     ) -> CallableSyncOrAsyncType:
-        defn = _UpdateDefinition(name=name, fn=fn, is_method=True)
+        if not name and not dynamic:
+            name = fn.__name__
+        defn = _UpdateDefinition(
+            name=name,
+            fn=fn,
+            is_method=True,
+            unfinished_policy=unfinished_policy,
+        )
         if defn.dynamic_vararg:
             raise RuntimeError(
                 "Dynamic updates do not support a vararg third param, use Sequence[RawValue]",
@@ -937,13 +1065,12 @@ def update(
         setattr(fn, "validator", partial(_update_validator, defn))
         return fn
 
-    if name is not None or dynamic:
+    if not fn:
         if name is not None and dynamic:
             raise RuntimeError("Cannot provide name and dynamic boolean")
-        return partial(with_name, name)
-    if fn is None:
-        raise RuntimeError("Cannot create update without function or name or dynamic")
-    return with_name(fn.__name__, fn)
+        return partial(decorator, name, unfinished_policy)
+    else:
+        return decorator(fn.__name__, unfinished_policy, fn)
 
 
 def _update_validator(
@@ -1162,6 +1289,7 @@ class _Definition:
     queries: Mapping[Optional[str], _QueryDefinition]
     updates: Mapping[Optional[str], _UpdateDefinition]
     sandboxed: bool
+    failure_exception_types: Sequence[Type[BaseException]]
     # Types loaded on post init if both are None
     arg_types: Optional[List[Type]] = None
     ret_type: Optional[Type] = None
@@ -1200,7 +1328,11 @@ class _Definition:
 
     @staticmethod
     def _apply_to_class(
-        cls: Type, *, workflow_name: Optional[str], sandboxed: bool
+        cls: Type,
+        *,
+        workflow_name: Optional[str],
+        sandboxed: bool,
+        failure_exception_types: Sequence[Type[BaseException]],
     ) -> None:
         # Check it's not being doubly applied
         if _Definition.from_class(cls):
@@ -1323,6 +1455,7 @@ class _Definition:
             queries=queries,
             updates=updates,
             sandboxed=sandboxed,
+            failure_exception_types=failure_exception_types,
         )
         setattr(cls, "__temporal_workflow_definition", defn)
         setattr(run_fn, "__temporal_workflow_definition", defn)
@@ -1394,6 +1527,9 @@ class _SignalDefinition:
     name: Optional[str]
     fn: Callable[..., Union[None, Awaitable[None]]]
     is_method: bool
+    unfinished_policy: HandlerUnfinishedPolicy = (
+        HandlerUnfinishedPolicy.WARN_AND_ABANDON
+    )
     # Types loaded on post init if None
     arg_types: Optional[List[Type]] = None
     dynamic_vararg: bool = False
@@ -1475,6 +1611,9 @@ class _UpdateDefinition:
     name: Optional[str]
     fn: Callable[..., Union[Any, Awaitable[Any]]]
     is_method: bool
+    unfinished_policy: HandlerUnfinishedPolicy = (
+        HandlerUnfinishedPolicy.WARN_AND_ABANDON
+    )
     # Types loaded on post init if None
     arg_types: Optional[List[Type]] = None
     ret_type: Optional[Type] = None
@@ -4342,6 +4481,189 @@ def set_dynamic_update_handler(
         validator: Callable to set or None to unset as the update validator.
     """
     _Runtime.current().workflow_set_update_handler(None, handler, validator)
+
+
+def all_handlers_finished() -> bool:
+    """Whether update and signal handlers have finished executing.
+
+    Consider waiting on this condition before workflow return or continue-as-new, to prevent
+    interruption of in-progress handlers by workflow exit:
+    ``await workflow.wait_condition(lambda: workflow.all_handlers_finished())``
+
+    Returns:
+        True if there are no in-progress update or signal handler executions.
+    """
+    return _Runtime.current().workflow_all_handlers_finished()
+
+
+def as_completed(
+    fs: Iterable[Awaitable[AnyType]], *, timeout: Optional[float] = None
+) -> Iterator[Awaitable[AnyType]]:
+    """Return an iterator whose values are coroutines.
+
+    This is a deterministic version of :py:func:`asyncio.as_completed`. This
+    function should be used instead of that one in workflows.
+    """
+    # Taken almost verbatim from
+    # https://github.com/python/cpython/blob/v3.12.3/Lib/asyncio/tasks.py#L584
+    # but the "set" is changed out for a "list" and fixed up some typing/format
+
+    if asyncio.isfuture(fs) or asyncio.iscoroutine(fs):
+        raise TypeError(f"expect an iterable of futures, not {type(fs).__name__}")
+
+    done: asyncio.Queue[Optional[asyncio.Future]] = asyncio.Queue()
+
+    loop = asyncio.get_event_loop()
+    todo: List[asyncio.Future] = [asyncio.ensure_future(f, loop=loop) for f in list(fs)]
+    timeout_handle = None
+
+    def _on_timeout():
+        for f in todo:
+            f.remove_done_callback(_on_completion)
+            done.put_nowait(None)  # Queue a dummy value for _wait_for_one().
+        todo.clear()  # Can't do todo.remove(f) in the loop.
+
+    def _on_completion(f):
+        if not todo:
+            return  # _on_timeout() was here first.
+        todo.remove(f)
+        done.put_nowait(f)
+        if not todo and timeout_handle is not None:
+            timeout_handle.cancel()
+
+    async def _wait_for_one():
+        f = await done.get()
+        if f is None:
+            # Dummy value from _on_timeout().
+            raise asyncio.TimeoutError
+        return f.result()  # May raise f.exception().
+
+    for f in todo:
+        f.add_done_callback(_on_completion)
+    if todo and timeout is not None:
+        timeout_handle = loop.call_later(timeout, _on_timeout)
+    for _ in range(len(todo)):
+        yield _wait_for_one()
+
+
+if TYPE_CHECKING:
+    _FT = TypeVar("_FT", bound=asyncio.Future[Any])
+else:
+    _FT = TypeVar("_FT", bound=asyncio.Future)
+
+
+@overload
+async def wait(  # type: ignore[misc]
+    fs: Iterable[_FT],
+    *,
+    timeout: Optional[float] = None,
+    return_when: str = asyncio.ALL_COMPLETED,
+) -> Tuple[List[_FT], List[_FT]]:
+    ...
+
+
+@overload
+async def wait(
+    fs: Iterable[asyncio.Task[AnyType]],
+    *,
+    timeout: Optional[float] = None,
+    return_when: str = asyncio.ALL_COMPLETED,
+) -> Tuple[List[asyncio.Task[AnyType]], set[asyncio.Task[AnyType]]]:
+    ...
+
+
+async def wait(
+    fs: Iterable,
+    *,
+    timeout: Optional[float] = None,
+    return_when: str = asyncio.ALL_COMPLETED,
+) -> Tuple:
+    """Wait for the Futures or Tasks given by fs to complete.
+
+    This is a deterministic version of :py:func:`asyncio.wait`. This function
+    should be used instead of that one in workflows.
+    """
+    # Taken almost verbatim from
+    # https://github.com/python/cpython/blob/v3.12.3/Lib/asyncio/tasks.py#L435
+    # but the "set" is changed out for a "list" and fixed up some typing/format
+
+    if asyncio.isfuture(fs) or asyncio.iscoroutine(fs):
+        raise TypeError(f"expect a list of futures, not {type(fs).__name__}")
+    if not fs:
+        raise ValueError("Set of Tasks/Futures is empty.")
+    if return_when not in (
+        asyncio.FIRST_COMPLETED,
+        asyncio.FIRST_EXCEPTION,
+        asyncio.ALL_COMPLETED,
+    ):
+        raise ValueError(f"Invalid return_when value: {return_when}")
+
+    fs = list(fs)
+
+    if any(asyncio.iscoroutine(f) for f in fs):
+        raise TypeError("Passing coroutines is forbidden, use tasks explicitly.")
+
+    loop = asyncio.get_running_loop()
+    return await _wait(fs, timeout, return_when, loop)
+
+
+async def _wait(
+    fs: Iterable[Union[asyncio.Future, asyncio.Task]],
+    timeout: Optional[float],
+    return_when: str,
+    loop: asyncio.AbstractEventLoop,
+) -> Tuple[List, List]:
+    # Taken almost verbatim from
+    # https://github.com/python/cpython/blob/v3.12.3/Lib/asyncio/tasks.py#L522
+    # but the "set" is changed out for a "list" and fixed up some typing/format
+
+    assert fs, "Set of Futures is empty."
+    waiter = loop.create_future()
+    timeout_handle = None
+    if timeout is not None:
+        timeout_handle = loop.call_later(timeout, _release_waiter, waiter)
+    counter = len(fs)  # type: ignore[arg-type]
+
+    def _on_completion(f):
+        nonlocal counter
+        counter -= 1
+        if (
+            counter <= 0
+            or return_when == asyncio.FIRST_COMPLETED
+            or return_when == asyncio.FIRST_EXCEPTION
+            and (not f.cancelled() and f.exception() is not None)
+        ):
+            if timeout_handle is not None:
+                timeout_handle.cancel()
+            if not waiter.done():
+                waiter.set_result(None)
+
+    for f in fs:
+        f.add_done_callback(_on_completion)
+
+    try:
+        await waiter
+    finally:
+        if timeout_handle is not None:
+            timeout_handle.cancel()
+        for f in fs:
+            f.remove_done_callback(_on_completion)
+
+    done, pending = [], []
+    for f in fs:
+        if f.done():
+            done.append(f)
+        else:
+            pending.append(f)
+    return done, pending
+
+
+def _release_waiter(waiter: asyncio.Future[Any], *args) -> None:
+    # Taken almost verbatim from
+    # https://github.com/python/cpython/blob/v3.12.3/Lib/asyncio/tasks.py#L467
+
+    if not waiter.done():
+        waiter.set_result(None)
 
 
 def _is_unbound_method_on_cls(fn: Callable[..., Any], cls: Type) -> bool:

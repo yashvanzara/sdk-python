@@ -93,6 +93,20 @@ class WorkflowServiceStub:
     also schedule the first workflow task. Returns `WorkflowExecutionAlreadyStarted`, if an
     instance already exists with same workflow id.
     """
+    ExecuteMultiOperation: grpc.UnaryUnaryMultiCallable[
+        temporalio.api.workflowservice.v1.request_response_pb2.ExecuteMultiOperationRequest,
+        temporalio.api.workflowservice.v1.request_response_pb2.ExecuteMultiOperationResponse,
+    ]
+    """ExecuteMultiOperation executes multiple operations within a single workflow.
+
+    Operations are started atomically, meaning if *any* operation fails to be started, none are,
+    and the request fails. Upon start, the API returns only when *all* operations have a response.
+
+    Upon failure, it returns `MultiOperationExecutionFailure` where the status code
+    equals the status code of the *first* operation that failed to be started.
+
+    NOTE: Experimental API.
+    """
     GetWorkflowExecutionHistory: grpc.UnaryUnaryMultiCallable[
         temporalio.api.workflowservice.v1.request_response_pb2.GetWorkflowExecutionHistoryRequest,
         temporalio.api.workflowservice.v1.request_response_pb2.GetWorkflowExecutionHistoryResponse,
@@ -414,7 +428,11 @@ class WorkflowServiceStub:
         temporalio.api.workflowservice.v1.request_response_pb2.DescribeTaskQueueRequest,
         temporalio.api.workflowservice.v1.request_response_pb2.DescribeTaskQueueResponse,
     ]
-    """DescribeTaskQueue returns information about the target task queue."""
+    """DescribeTaskQueue returns the following information about the target task queue, broken down by Build ID:
+      - List of pollers
+      - Workflow Reachability status
+      - Backlog info for Workflow and/or Activity tasks
+    """
     GetClusterInfo: grpc.UnaryUnaryMultiCallable[
         temporalio.api.workflowservice.v1.request_response_pb2.GetClusterInfoRequest,
         temporalio.api.workflowservice.v1.request_response_pb2.GetClusterInfoResponse,
@@ -471,7 +489,9 @@ class WorkflowServiceStub:
         temporalio.api.workflowservice.v1.request_response_pb2.UpdateWorkerBuildIdCompatibilityRequest,
         temporalio.api.workflowservice.v1.request_response_pb2.UpdateWorkerBuildIdCompatibilityResponse,
     ]
-    """Allows users to specify sets of worker build id versions on a per task queue basis. Versions
+    """Deprecated. Use `UpdateWorkerVersioningRules`.
+
+    Allows users to specify sets of worker build id versions on a per task queue basis. Versions
     are ordered, and may be either compatible with some extant version, or a new incompatible
     version, forming sets of ids which are incompatible with each other, but whose contained
     members are compatible with one another.
@@ -491,12 +511,51 @@ class WorkflowServiceStub:
         temporalio.api.workflowservice.v1.request_response_pb2.GetWorkerBuildIdCompatibilityRequest,
         temporalio.api.workflowservice.v1.request_response_pb2.GetWorkerBuildIdCompatibilityResponse,
     ]
-    """Fetches the worker build id versioning sets for a task queue."""
+    """Deprecated. Use `GetWorkerVersioningRules`.
+    Fetches the worker build id versioning sets for a task queue.
+    """
+    UpdateWorkerVersioningRules: grpc.UnaryUnaryMultiCallable[
+        temporalio.api.workflowservice.v1.request_response_pb2.UpdateWorkerVersioningRulesRequest,
+        temporalio.api.workflowservice.v1.request_response_pb2.UpdateWorkerVersioningRulesResponse,
+    ]
+    """Use this API to manage Worker Versioning Rules for a given Task Queue. There are two types of
+    rules: Build ID Assignment rules and Compatible Build ID Redirect rules.
+
+    Assignment rules are used to assign a Build ID for a new execution when it starts. Its primary
+    use case is to specify the latest Build ID but it has powerful features for gradual rollout
+    of a new Build ID.
+
+    Once a Build ID is assigned to a workflow execution and it completes its first Workflow Task,
+    the workflow stays on the assigned Build ID regardless of changes in assignment rules. This
+    eliminates the need for compatibility between versions when you only care about using the new
+    version for new workflows and let existing workflows finish in their own version.
+
+    Activities, Child Workflows and Continue-as-New executions have the option to inherit their
+    parent/previous workflow or use the latest assigment rules to independently select a Build ID.
+
+    Redirect rules should only be used when you want to move workflows and activities assigned to
+    one Build ID (source) to another compatible Build ID (target). You are responsible to make sure
+    the target Build ID of a redirect rule is able to process event histories made by the source
+    Build ID by using [Patching](https://docs.temporal.io/workflows#patching) or other means.
+
+    WARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.
+    (-- api-linter: core::0127::http-annotation=disabled
+        aip.dev/not-precedent: We do yet expose versioning API to HTTP. --)
+    """
+    GetWorkerVersioningRules: grpc.UnaryUnaryMultiCallable[
+        temporalio.api.workflowservice.v1.request_response_pb2.GetWorkerVersioningRulesRequest,
+        temporalio.api.workflowservice.v1.request_response_pb2.GetWorkerVersioningRulesResponse,
+    ]
+    """Fetches the Build ID assignment and redirect rules for a Task Queue.
+    WARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.
+    """
     GetWorkerTaskReachability: grpc.UnaryUnaryMultiCallable[
         temporalio.api.workflowservice.v1.request_response_pb2.GetWorkerTaskReachabilityRequest,
         temporalio.api.workflowservice.v1.request_response_pb2.GetWorkerTaskReachabilityResponse,
     ]
-    """Fetches task reachability to determine whether a worker may be retired.
+    """Deprecated. Use `DescribeTaskQueue`.
+
+    Fetches task reachability to determine whether a worker may be retired.
     The request may specify task queues to query for or let the server fetch all task queues mapped to the given
     build IDs.
 
@@ -546,6 +605,30 @@ class WorkflowServiceStub:
         temporalio.api.workflowservice.v1.request_response_pb2.ListBatchOperationsResponse,
     ]
     """ListBatchOperations returns a list of batch operations"""
+    PollNexusTaskQueue: grpc.UnaryUnaryMultiCallable[
+        temporalio.api.workflowservice.v1.request_response_pb2.PollNexusTaskQueueRequest,
+        temporalio.api.workflowservice.v1.request_response_pb2.PollNexusTaskQueueResponse,
+    ]
+    """PollNexusTaskQueue is a long poll call used by workers to receive Nexus tasks.
+    (-- api-linter: core::0127::http-annotation=disabled
+        aip.dev/not-precedent: We do not expose worker API to HTTP. --)
+    """
+    RespondNexusTaskCompleted: grpc.UnaryUnaryMultiCallable[
+        temporalio.api.workflowservice.v1.request_response_pb2.RespondNexusTaskCompletedRequest,
+        temporalio.api.workflowservice.v1.request_response_pb2.RespondNexusTaskCompletedResponse,
+    ]
+    """RespondNexusTaskCompleted is called by workers to respond to Nexus tasks received via PollNexusTaskQueue.
+    (-- api-linter: core::0127::http-annotation=disabled
+        aip.dev/not-precedent: We do not expose worker API to HTTP. --)
+    """
+    RespondNexusTaskFailed: grpc.UnaryUnaryMultiCallable[
+        temporalio.api.workflowservice.v1.request_response_pb2.RespondNexusTaskFailedRequest,
+        temporalio.api.workflowservice.v1.request_response_pb2.RespondNexusTaskFailedResponse,
+    ]
+    """RespondNexusTaskFailed is called by workers to fail Nexus tasks received via PollNexusTaskQueue.
+    (-- api-linter: core::0127::http-annotation=disabled
+        aip.dev/not-precedent: We do not expose worker API to HTTP. --)
+    """
 
 class WorkflowServiceServicer(metaclass=abc.ABCMeta):
     """WorkflowService API defines how Temporal SDKs and other clients interact with the Temporal server
@@ -631,6 +714,24 @@ class WorkflowServiceServicer(metaclass=abc.ABCMeta):
         It will create the execution with a `WORKFLOW_EXECUTION_STARTED` event in its history and
         also schedule the first workflow task. Returns `WorkflowExecutionAlreadyStarted`, if an
         instance already exists with same workflow id.
+        """
+    @abc.abstractmethod
+    def ExecuteMultiOperation(
+        self,
+        request: temporalio.api.workflowservice.v1.request_response_pb2.ExecuteMultiOperationRequest,
+        context: grpc.ServicerContext,
+    ) -> (
+        temporalio.api.workflowservice.v1.request_response_pb2.ExecuteMultiOperationResponse
+    ):
+        """ExecuteMultiOperation executes multiple operations within a single workflow.
+
+        Operations are started atomically, meaning if *any* operation fails to be started, none are,
+        and the request fails. Upon start, the API returns only when *all* operations have a response.
+
+        Upon failure, it returns `MultiOperationExecutionFailure` where the status code
+        equals the status code of the *first* operation that failed to be started.
+
+        NOTE: Experimental API.
         """
     @abc.abstractmethod
     def GetWorkflowExecutionHistory(
@@ -1079,7 +1180,11 @@ class WorkflowServiceServicer(metaclass=abc.ABCMeta):
     ) -> (
         temporalio.api.workflowservice.v1.request_response_pb2.DescribeTaskQueueResponse
     ):
-        """DescribeTaskQueue returns information about the target task queue."""
+        """DescribeTaskQueue returns the following information about the target task queue, broken down by Build ID:
+        - List of pollers
+        - Workflow Reachability status
+        - Backlog info for Workflow and/or Activity tasks
+        """
     @abc.abstractmethod
     def GetClusterInfo(
         self,
@@ -1166,7 +1271,9 @@ class WorkflowServiceServicer(metaclass=abc.ABCMeta):
     ) -> (
         temporalio.api.workflowservice.v1.request_response_pb2.UpdateWorkerBuildIdCompatibilityResponse
     ):
-        """Allows users to specify sets of worker build id versions on a per task queue basis. Versions
+        """Deprecated. Use `UpdateWorkerVersioningRules`.
+
+        Allows users to specify sets of worker build id versions on a per task queue basis. Versions
         are ordered, and may be either compatible with some extant version, or a new incompatible
         version, forming sets of ids which are incompatible with each other, but whose contained
         members are compatible with one another.
@@ -1190,7 +1297,52 @@ class WorkflowServiceServicer(metaclass=abc.ABCMeta):
     ) -> (
         temporalio.api.workflowservice.v1.request_response_pb2.GetWorkerBuildIdCompatibilityResponse
     ):
-        """Fetches the worker build id versioning sets for a task queue."""
+        """Deprecated. Use `GetWorkerVersioningRules`.
+        Fetches the worker build id versioning sets for a task queue.
+        """
+    @abc.abstractmethod
+    def UpdateWorkerVersioningRules(
+        self,
+        request: temporalio.api.workflowservice.v1.request_response_pb2.UpdateWorkerVersioningRulesRequest,
+        context: grpc.ServicerContext,
+    ) -> (
+        temporalio.api.workflowservice.v1.request_response_pb2.UpdateWorkerVersioningRulesResponse
+    ):
+        """Use this API to manage Worker Versioning Rules for a given Task Queue. There are two types of
+        rules: Build ID Assignment rules and Compatible Build ID Redirect rules.
+
+        Assignment rules are used to assign a Build ID for a new execution when it starts. Its primary
+        use case is to specify the latest Build ID but it has powerful features for gradual rollout
+        of a new Build ID.
+
+        Once a Build ID is assigned to a workflow execution and it completes its first Workflow Task,
+        the workflow stays on the assigned Build ID regardless of changes in assignment rules. This
+        eliminates the need for compatibility between versions when you only care about using the new
+        version for new workflows and let existing workflows finish in their own version.
+
+        Activities, Child Workflows and Continue-as-New executions have the option to inherit their
+        parent/previous workflow or use the latest assigment rules to independently select a Build ID.
+
+        Redirect rules should only be used when you want to move workflows and activities assigned to
+        one Build ID (source) to another compatible Build ID (target). You are responsible to make sure
+        the target Build ID of a redirect rule is able to process event histories made by the source
+        Build ID by using [Patching](https://docs.temporal.io/workflows#patching) or other means.
+
+        WARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.
+        (-- api-linter: core::0127::http-annotation=disabled
+            aip.dev/not-precedent: We do yet expose versioning API to HTTP. --)
+        """
+    @abc.abstractmethod
+    def GetWorkerVersioningRules(
+        self,
+        request: temporalio.api.workflowservice.v1.request_response_pb2.GetWorkerVersioningRulesRequest,
+        context: grpc.ServicerContext,
+    ) -> (
+        temporalio.api.workflowservice.v1.request_response_pb2.GetWorkerVersioningRulesResponse
+    ):
+        """Fetches the Build ID assignment and redirect rules for a Task Queue.
+        WARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.
+        """
     @abc.abstractmethod
     def GetWorkerTaskReachability(
         self,
@@ -1199,7 +1351,9 @@ class WorkflowServiceServicer(metaclass=abc.ABCMeta):
     ) -> (
         temporalio.api.workflowservice.v1.request_response_pb2.GetWorkerTaskReachabilityResponse
     ):
-        """Fetches task reachability to determine whether a worker may be retired.
+        """Deprecated. Use `DescribeTaskQueue`.
+
+        Fetches task reachability to determine whether a worker may be retired.
         The request may specify task queues to query for or let the server fetch all task queues mapped to the given
         build IDs.
 
@@ -1273,6 +1427,42 @@ class WorkflowServiceServicer(metaclass=abc.ABCMeta):
         temporalio.api.workflowservice.v1.request_response_pb2.ListBatchOperationsResponse
     ):
         """ListBatchOperations returns a list of batch operations"""
+    @abc.abstractmethod
+    def PollNexusTaskQueue(
+        self,
+        request: temporalio.api.workflowservice.v1.request_response_pb2.PollNexusTaskQueueRequest,
+        context: grpc.ServicerContext,
+    ) -> (
+        temporalio.api.workflowservice.v1.request_response_pb2.PollNexusTaskQueueResponse
+    ):
+        """PollNexusTaskQueue is a long poll call used by workers to receive Nexus tasks.
+        (-- api-linter: core::0127::http-annotation=disabled
+            aip.dev/not-precedent: We do not expose worker API to HTTP. --)
+        """
+    @abc.abstractmethod
+    def RespondNexusTaskCompleted(
+        self,
+        request: temporalio.api.workflowservice.v1.request_response_pb2.RespondNexusTaskCompletedRequest,
+        context: grpc.ServicerContext,
+    ) -> (
+        temporalio.api.workflowservice.v1.request_response_pb2.RespondNexusTaskCompletedResponse
+    ):
+        """RespondNexusTaskCompleted is called by workers to respond to Nexus tasks received via PollNexusTaskQueue.
+        (-- api-linter: core::0127::http-annotation=disabled
+            aip.dev/not-precedent: We do not expose worker API to HTTP. --)
+        """
+    @abc.abstractmethod
+    def RespondNexusTaskFailed(
+        self,
+        request: temporalio.api.workflowservice.v1.request_response_pb2.RespondNexusTaskFailedRequest,
+        context: grpc.ServicerContext,
+    ) -> (
+        temporalio.api.workflowservice.v1.request_response_pb2.RespondNexusTaskFailedResponse
+    ):
+        """RespondNexusTaskFailed is called by workers to fail Nexus tasks received via PollNexusTaskQueue.
+        (-- api-linter: core::0127::http-annotation=disabled
+            aip.dev/not-precedent: We do not expose worker API to HTTP. --)
+        """
 
 def add_WorkflowServiceServicer_to_server(
     servicer: WorkflowServiceServicer, server: grpc.Server

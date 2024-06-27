@@ -29,6 +29,7 @@ import temporalio.service
 
 from ._activity import SharedStateManager, _ActivityWorker
 from ._interceptor import Interceptor
+from ._tuning import WorkerTuner, _to_bridge_slot_supplier
 from ._workflow import _WorkflowWorker
 from ._workflow_instance import UnsandboxedWorkflowRunner, WorkflowRunner
 from .workflow_sandbox import SandboxedWorkflowRunner
@@ -60,9 +61,10 @@ class Worker:
         build_id: Optional[str] = None,
         identity: Optional[str] = None,
         max_cached_workflows: int = 1000,
-        max_concurrent_workflow_tasks: int = 100,
-        max_concurrent_activities: int = 100,
-        max_concurrent_local_activities: int = 100,
+        max_concurrent_workflow_tasks: Optional[int] = None,
+        max_concurrent_activities: Optional[int] = None,
+        max_concurrent_local_activities: Optional[int] = None,
+        tuner: Optional[WorkerTuner] = None,
         max_concurrent_workflow_task_polls: int = 5,
         nonsticky_to_sticky_poll_ratio: float = 0.2,
         max_concurrent_activity_task_polls: int = 5,
@@ -73,11 +75,13 @@ class Worker:
         max_activities_per_second: Optional[float] = None,
         max_task_queue_activities_per_second: Optional[float] = None,
         graceful_shutdown_timeout: timedelta = timedelta(),
+        workflow_failure_exception_types: Sequence[Type[BaseException]] = [],
         shared_state_manager: Optional[SharedStateManager] = None,
         debug_mode: bool = False,
         disable_eager_activity_execution: bool = False,
         on_fatal_error: Optional[Callable[[BaseException], Awaitable[None]]] = None,
         use_worker_versioning: bool = False,
+        disable_safe_workflow_eviction: bool = False,
     ) -> None:
         """Create a worker to process workflows and/or activities.
 
@@ -124,11 +128,16 @@ class Worker:
             max_cached_workflows: If nonzero, workflows will be cached and
                 sticky task queues will be used.
             max_concurrent_workflow_tasks: Maximum allowed number of workflow
-                tasks that will ever be given to this worker at one time.
+                tasks that will ever be given to this worker at one time. Mutually exclusive with ``tuner``.
             max_concurrent_activities: Maximum number of activity tasks that
-                will ever be given to this worker concurrently.
+                will ever be given to this worker concurrently. Mutually exclusive with ``tuner``.
             max_concurrent_local_activities: Maximum number of local activity
-                tasks that will ever be given to this worker concurrently.
+                tasks that will ever be given to this worker concurrently. Mutually exclusive with ``tuner``.
+            tuner:  Provide a custom :py:class:`WorkerTuner`. Mutually exclusive with the
+                ``max_concurrent_workflow_tasks``, ``max_concurrent_activities``, and
+                ``max_concurrent_local_activities`` arguments.
+
+                WARNING: This argument is experimental
             max_concurrent_workflow_task_polls: Maximum number of concurrent
                 poll workflow task requests we will perform at a time on this
                 worker's task queue.
@@ -166,6 +175,13 @@ class Worker:
             graceful_shutdown_timeout: Amount of time after shutdown is called
                 that activities are given to complete before their tasks are
                 cancelled.
+            workflow_failure_exception_types: The types of exceptions that, if a
+                workflow-thrown exception extends, will cause the
+                workflow/update to fail instead of suspending the workflow via
+                task failure. These are applied in addition to ones set on the
+                ``workflow.defn`` decorator. If ``Exception`` is set, it
+                effectively will fail a workflow/update in all user exception
+                cases. WARNING: This setting is experimental.
             shared_state_manager: Used for obtaining cross-process friendly
                 synchronization primitives. This is required for non-async
                 activities where the activity_executor is not a
@@ -183,11 +199,19 @@ class Worker:
             on_fatal_error: An async function that can handle a failure before
                 the worker shutdown commences. This cannot stop the shutdown and
                 any exception raised is logged and ignored.
-            use_worker_versioning: If true, the `build_id` argument must be specified, and this
-                worker opts into the worker versioning feature. This ensures it only receives
-                workflow tasks for workflows which it claims to be compatible with.
-
-                For more information, see https://docs.temporal.io/workers#worker-versioning
+            use_worker_versioning: If true, the `build_id` argument must be
+                specified, and this worker opts into the worker versioning
+                feature. This ensures it only receives workflow tasks for
+                workflows which it claims to be compatible with. For more
+                information, see
+                https://docs.temporal.io/workers#worker-versioning.
+            disable_safe_workflow_eviction: If true, instead of letting the
+                workflow collect its tasks properly, the worker will simply let
+                the Python garbage collector collect the tasks. WARNING: Users
+                should not set this value to true. The garbage collector will
+                throw ``GeneratorExit`` in coroutines causing them to wake up
+                in different threads and run ``finally`` and other code in the
+                wrong workflow environment.
         """
         if not activities and not workflows:
             raise ValueError("At least one activity or workflow must be specified")
@@ -204,23 +228,8 @@ class Worker:
         )
         interceptors = interceptors_from_client + list(interceptors)
 
-        # Extract the bridge service client. We try the service on the client
-        # first, then we support a worker_service_client on the client's service
-        # to return underlying service client we can use.
-        bridge_client: temporalio.service._BridgeServiceClient
-        if isinstance(client.service_client, temporalio.service._BridgeServiceClient):
-            bridge_client = client.service_client
-        elif hasattr(client.service_client, "worker_service_client"):
-            bridge_client = client.service_client.worker_service_client
-            if not isinstance(bridge_client, temporalio.service._BridgeServiceClient):
-                raise TypeError(
-                    "Client's worker_service_client cannot be used for a worker"
-                )
-        else:
-            raise TypeError(
-                "Client cannot be used for a worker. "
-                + "Use the original client's service or set worker_service_client on the wrapped service with the original service client."
-            )
+        # Extract the bridge service client
+        bridge_client = _extract_bridge_client_for_worker(client)
 
         # Store the config for tracking
         self._config = WorkerConfig(
@@ -249,11 +258,13 @@ class Worker:
             max_activities_per_second=max_activities_per_second,
             max_task_queue_activities_per_second=max_task_queue_activities_per_second,
             graceful_shutdown_timeout=graceful_shutdown_timeout,
+            workflow_failure_exception_types=workflow_failure_exception_types,
             shared_state_manager=shared_state_manager,
             debug_mode=debug_mode,
             disable_eager_activity_execution=disable_eager_activity_execution,
             on_fatal_error=on_fatal_error,
             use_worker_versioning=use_worker_versioning,
+            disable_safe_workflow_eviction=disable_safe_workflow_eviction,
         )
         self._started = False
         self._shutdown_event = asyncio.Event()
@@ -264,15 +275,22 @@ class Worker:
 
         # Create activity and workflow worker
         self._activity_worker: Optional[_ActivityWorker] = None
-        runtime = bridge_client.config.runtime or temporalio.runtime.Runtime.default()
+        self._runtime = (
+            bridge_client.config.runtime or temporalio.runtime.Runtime.default()
+        )
         if activities:
             # Issue warning here if executor max_workers is lower than max
             # concurrent activities. We do this here instead of in
             # _ActivityWorker so the stack level is predictable.
             max_workers = getattr(activity_executor, "_max_workers", None)
-            if isinstance(max_workers, int) and max_workers < max_concurrent_activities:
+            concurrent_activities = max_concurrent_activities
+            if tuner and tuner._get_activities_max():
+                concurrent_activities = tuner._get_activities_max()
+            if isinstance(max_workers, int) and max_workers < (
+                concurrent_activities or 0
+            ):
                 warnings.warn(
-                    f"Worker max_concurrent_activities is {max_concurrent_activities} "
+                    f"Worker max_concurrent_activities is {concurrent_activities} "
                     + f"but activity_executor's max_workers is only {max_workers}",
                     stacklevel=2,
                 )
@@ -285,7 +303,7 @@ class Worker:
                 shared_state_manager=shared_state_manager,
                 data_converter=client_config["data_converter"],
                 interceptors=interceptors,
-                metric_meter=runtime.metric_meter,
+                metric_meter=self._runtime.metric_meter,
             )
         self._workflow_worker: Optional[_WorkflowWorker] = None
         if workflows:
@@ -299,22 +317,36 @@ class Worker:
                 unsandboxed_workflow_runner=unsandboxed_workflow_runner,
                 data_converter=client_config["data_converter"],
                 interceptors=interceptors,
+                workflow_failure_exception_types=workflow_failure_exception_types,
                 debug_mode=debug_mode,
                 disable_eager_activity_execution=disable_eager_activity_execution,
-                metric_meter=runtime.metric_meter,
+                metric_meter=self._runtime.metric_meter,
                 on_eviction_hook=None,
+                disable_safe_eviction=disable_safe_workflow_eviction,
             )
 
-        # We need an already connected client
-        # TODO(cretz): How to connect to client inside constructor here? In the
-        # meantime, we disallow lazy clients from being used for workers. We
-        # could check whether the connected client is present which means
-        # lazy-but-already-connected clients would work, but that is confusing
-        # to users that the client only works if they already made a call on it.
-        if bridge_client.config.lazy:
-            raise RuntimeError("Lazy clients cannot be used for workers")
-        raw_bridge_client = bridge_client._bridge_client
-        assert raw_bridge_client
+        workflow_slot_supplier: temporalio.bridge.worker.SlotSupplier
+        activity_slot_supplier: temporalio.bridge.worker.SlotSupplier
+        local_activity_slot_supplier: temporalio.bridge.worker.SlotSupplier
+
+        if tuner is not None:
+            if (
+                max_concurrent_workflow_tasks
+                or max_concurrent_activities
+                or max_concurrent_local_activities
+            ):
+                raise ValueError(
+                    "Cannot specify max_concurrent_workflow_tasks, max_concurrent_activities, "
+                    "or max_concurrent_local_activities when also specifying tuner"
+                )
+        else:
+            tuner = WorkerTuner.create_fixed(
+                workflow_slots=max_concurrent_workflow_tasks,
+                activity_slots=max_concurrent_activities,
+                local_activity_slots=max_concurrent_local_activities,
+            )
+
+        bridge_tuner = tuner._to_bridge_tuner()
 
         # Create bridge worker last. We have empirically observed that if it is
         # created before an error is raised from the activity worker
@@ -322,17 +354,16 @@ class Worker:
         # free it.
         # TODO(cretz): Why does this cause a test hang when an exception is
         # thrown after it?
+        assert bridge_client._bridge_client
         self._bridge_worker = temporalio.bridge.worker.Worker.create(
-            raw_bridge_client,
+            bridge_client._bridge_client,
             temporalio.bridge.worker.WorkerConfig(
                 namespace=client.namespace,
                 task_queue=task_queue,
                 build_id=build_id or load_default_build_id(),
                 identity_override=identity,
                 max_cached_workflows=max_cached_workflows,
-                max_outstanding_workflow_tasks=max_concurrent_workflow_tasks,
-                max_outstanding_activities=max_concurrent_activities,
-                max_outstanding_local_activities=max_concurrent_local_activities,
+                tuner=bridge_tuner,
                 max_concurrent_workflow_task_polls=max_concurrent_workflow_task_polls,
                 nonsticky_to_sticky_poll_ratio=nonsticky_to_sticky_poll_ratio,
                 max_concurrent_activity_task_polls=max_concurrent_activity_task_polls,
@@ -355,6 +386,16 @@ class Worker:
                     1000 * graceful_shutdown_timeout.total_seconds()
                 ),
                 use_worker_versioning=use_worker_versioning,
+                # Need to tell core whether we want to consider all
+                # non-determinism exceptions as workflow fail, and whether we do
+                # per workflow type
+                nondeterminism_as_workflow_fail=self._workflow_worker is not None
+                and self._workflow_worker.nondeterminism_as_workflow_fail(),
+                nondeterminism_as_workflow_fail_for_types=(
+                    self._workflow_worker.nondeterminism_as_workflow_fail_for_types()
+                    if self._workflow_worker
+                    else set()
+                ),
             ),
         )
 
@@ -373,6 +414,29 @@ class Worker:
     def task_queue(self) -> str:
         """Task queue this worker is on."""
         return self._config["task_queue"]
+
+    @property
+    def client(self) -> temporalio.client.Client:
+        """Client currently set on the worker."""
+        return self._config["client"]
+
+    @client.setter
+    def client(self, value: temporalio.client.Client) -> None:
+        """Update the client associated with the worker.
+
+        Changing the client will make sure the worker starts using it for the
+        next calls it makes. However, outstanding client calls will still
+        complete with the existing client. The new client cannot be "lazy" and
+        must be using the same runtime as the current client.
+        """
+        bridge_client = _extract_bridge_client_for_worker(value)
+        if self._runtime is not bridge_client.config.runtime:
+            raise ValueError(
+                "New client is not on the same runtime as the existing client"
+            )
+        assert bridge_client._bridge_client
+        self._bridge_worker.replace_client(bridge_client._bridge_client)
+        self._config["client"] = value
 
     @property
     def is_running(self) -> bool:
@@ -410,6 +474,9 @@ class Worker:
         also cancel the shutdown process. Therefore users are encouraged to use
         explicit shutdown instead.
         """
+        # Eagerly validate which will do a namespace check in Core
+        await self._bridge_worker.validate()
+
         if self._started:
             raise RuntimeError("Already started")
         self._started = True
@@ -473,9 +540,11 @@ class Worker:
             assert self._workflow_worker
             tasks[2] = asyncio.create_task(self._workflow_worker.drain_poll_queue())
 
-        # Set worker-shutdown event
+        # Notify shutdown occurring
         if self._activity_worker:
             self._activity_worker.notify_shutdown()
+        if self._workflow_worker:
+            self._workflow_worker.notify_shutdown()
 
         # Wait for all tasks to complete (i.e. for poller loops to stop)
         await asyncio.wait(tasks)
@@ -579,9 +648,10 @@ class WorkerConfig(TypedDict, total=False):
     build_id: Optional[str]
     identity: Optional[str]
     max_cached_workflows: int
-    max_concurrent_workflow_tasks: int
-    max_concurrent_activities: int
-    max_concurrent_local_activities: int
+    max_concurrent_workflow_tasks: Optional[int]
+    max_concurrent_activities: Optional[int]
+    max_concurrent_local_activities: Optional[int]
+    tuner: Optional[WorkerTuner]
     max_concurrent_workflow_task_polls: int
     nonsticky_to_sticky_poll_ratio: float
     max_concurrent_activity_task_polls: int
@@ -592,11 +662,13 @@ class WorkerConfig(TypedDict, total=False):
     max_activities_per_second: Optional[float]
     max_task_queue_activities_per_second: Optional[float]
     graceful_shutdown_timeout: timedelta
+    workflow_failure_exception_types: Sequence[Type[BaseException]]
     shared_state_manager: Optional[SharedStateManager]
     debug_mode: bool
     disable_eager_activity_execution: bool
     on_fatal_error: Optional[Callable[[BaseException], Awaitable[None]]]
     use_worker_versioning: bool
+    disable_safe_workflow_eviction: bool
 
 
 _default_build_id: Optional[str] = None
@@ -679,6 +751,38 @@ def _get_module_code(mod_name: str) -> Optional[bytes]:
     except Exception:
         pass
     return None
+
+
+def _extract_bridge_client_for_worker(
+    client: temporalio.client.Client,
+) -> temporalio.service._BridgeServiceClient:
+    # Extract the bridge service client. We try the service on the client first,
+    # then we support a worker_service_client on the client's service to return
+    # underlying service client we can use.
+    bridge_client: temporalio.service._BridgeServiceClient
+    if isinstance(client.service_client, temporalio.service._BridgeServiceClient):
+        bridge_client = client.service_client
+    elif hasattr(client.service_client, "worker_service_client"):
+        bridge_client = client.service_client.worker_service_client
+        if not isinstance(bridge_client, temporalio.service._BridgeServiceClient):
+            raise TypeError(
+                "Client's worker_service_client cannot be used for a worker"
+            )
+    else:
+        raise TypeError(
+            "Client cannot be used for a worker. "
+            + "Use the original client's service or set worker_service_client on the wrapped service with the original service client."
+        )
+
+    # We need an already connected client
+    # TODO(cretz): How to connect to client inside Worker constructor here? In
+    # the meantime, we disallow lazy clients from being used for workers. We
+    # could check whether the connected client is present which means
+    # lazy-but-already-connected clients would work, but that is confusing
+    # to users that the client only works if they already made a call on it.
+    if bridge_client.config.lazy:
+        raise RuntimeError("Lazy clients cannot be used for workers")
+    return bridge_client
 
 
 class _ShutdownRequested(RuntimeError):

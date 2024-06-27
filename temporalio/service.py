@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import IntEnum
-from typing import ClassVar, Generic, Mapping, Optional, Type, TypeVar, Union
+from typing import ClassVar, Generic, Mapping, Optional, Tuple, Type, TypeVar, Union
 
 import google.protobuf.empty_pb2
 import google.protobuf.message
@@ -25,7 +25,7 @@ import temporalio.bridge.proto.health.v1
 import temporalio.exceptions
 import temporalio.runtime
 
-__version__ = "1.5.1"
+__version__ = "1.6.0"
 
 ServiceRequest = TypeVar("ServiceRequest", bound=google.protobuf.message.Message)
 ServiceResponse = TypeVar("ServiceResponse", bound=google.protobuf.message.Message)
@@ -115,6 +115,24 @@ class KeepAliveConfig:
 KeepAliveConfig.default = KeepAliveConfig()
 
 
+@dataclass(frozen=True)
+class HttpConnectProxyConfig:
+    """Configuration for HTTP CONNECT proxy for client connections."""
+
+    target_host: str
+    """Target host:port for the HTTP CONNECT proxy."""
+    basic_auth: Optional[Tuple[str, str]] = None
+    """Basic auth for the HTTP CONNECT proxy if any as a user/pass tuple."""
+
+    def _to_bridge_config(
+        self,
+    ) -> temporalio.bridge.client.ClientHttpConnectProxyConfig:
+        return temporalio.bridge.client.ClientHttpConnectProxyConfig(
+            target_host=self.target_host,
+            basic_auth=self.basic_auth,
+        )
+
+
 @dataclass
 class ConnectConfig:
     """Config for connecting to the server."""
@@ -128,6 +146,7 @@ class ConnectConfig:
     identity: str = ""
     lazy: bool = False
     runtime: Optional[temporalio.runtime.Runtime] = None
+    http_connect_proxy_config: Optional[HttpConnectProxyConfig] = None
 
     def __post_init__(self) -> None:
         """Set extra defaults on unset properties."""
@@ -174,6 +193,9 @@ class ConnectConfig:
             identity=self.identity,
             client_name="temporal-python",
             client_version=__version__,
+            http_connect_proxy_config=self.http_connect_proxy_config._to_bridge_config()
+            if self.http_connect_proxy_config
+            else None,
         )
 
 
@@ -326,6 +348,11 @@ class WorkflowService:
             wsv1.DescribeWorkflowExecutionRequest,
             wsv1.DescribeWorkflowExecutionResponse,
         )
+        self.execute_multi_operation = client._new_call(
+            "execute_multi_operation",
+            wsv1.ExecuteMultiOperationRequest,
+            wsv1.ExecuteMultiOperationResponse,
+        )
         self.get_cluster_info = client._new_call(
             "get_cluster_info",
             wsv1.GetClusterInfoRequest,
@@ -350,6 +377,11 @@ class WorkflowService:
             "get_worker_task_reachability",
             wsv1.GetWorkerTaskReachabilityRequest,
             wsv1.GetWorkerTaskReachabilityResponse,
+        )
+        self.get_worker_versioning_rules = client._new_call(
+            "get_worker_versioning_rules",
+            wsv1.GetWorkerVersioningRulesRequest,
+            wsv1.GetWorkerVersioningRulesResponse,
         )
         self.get_workflow_execution_history = client._new_call(
             "get_workflow_execution_history",
@@ -415,6 +447,11 @@ class WorkflowService:
             "poll_activity_task_queue",
             wsv1.PollActivityTaskQueueRequest,
             wsv1.PollActivityTaskQueueResponse,
+        )
+        self.poll_nexus_task_queue = client._new_call(
+            "poll_nexus_task_queue",
+            wsv1.PollNexusTaskQueueRequest,
+            wsv1.PollNexusTaskQueueResponse,
         )
         self.poll_workflow_execution_update = client._new_call(
             "poll_workflow_execution_update",
@@ -491,6 +528,16 @@ class WorkflowService:
             wsv1.RespondActivityTaskFailedByIdRequest,
             wsv1.RespondActivityTaskFailedByIdResponse,
         )
+        self.respond_nexus_task_completed = client._new_call(
+            "respond_nexus_task_completed",
+            wsv1.RespondNexusTaskCompletedRequest,
+            wsv1.RespondNexusTaskCompletedResponse,
+        )
+        self.respond_nexus_task_failed = client._new_call(
+            "respond_nexus_task_failed",
+            wsv1.RespondNexusTaskFailedRequest,
+            wsv1.RespondNexusTaskFailedResponse,
+        )
         self.respond_query_task_completed = client._new_call(
             "respond_query_task_completed",
             wsv1.RespondQueryTaskCompletedRequest,
@@ -561,6 +608,11 @@ class WorkflowService:
             wsv1.UpdateWorkerBuildIdCompatibilityRequest,
             wsv1.UpdateWorkerBuildIdCompatibilityResponse,
         )
+        self.update_worker_versioning_rules = client._new_call(
+            "update_worker_versioning_rules",
+            wsv1.UpdateWorkerVersioningRulesRequest,
+            wsv1.UpdateWorkerVersioningRulesResponse,
+        )
 
 
 class OperatorService:
@@ -581,16 +633,40 @@ class OperatorService:
             osv1.AddSearchAttributesResponse,
             service="operator",
         )
+        self.create_nexus_endpoint = client._new_call(
+            "create_nexus_endpoint",
+            osv1.CreateNexusEndpointRequest,
+            osv1.CreateNexusEndpointResponse,
+            service="operator",
+        )
+        self.delete_nexus_endpoint = client._new_call(
+            "delete_nexus_endpoint",
+            osv1.DeleteNexusEndpointRequest,
+            osv1.DeleteNexusEndpointResponse,
+            service="operator",
+        )
         self.delete_namespace = client._new_call(
             "delete_namespace",
             osv1.DeleteNamespaceRequest,
             osv1.DeleteNamespaceResponse,
             service="operator",
         )
+        self.get_nexus_endpoint = client._new_call(
+            "get_nexus_endpoint",
+            osv1.GetNexusEndpointRequest,
+            osv1.GetNexusEndpointResponse,
+            service="operator",
+        )
         self.list_clusters = client._new_call(
             "list_clusters",
             osv1.ListClustersRequest,
             osv1.ListClustersResponse,
+            service="operator",
+        )
+        self.list_nexus_endpoints = client._new_call(
+            "list_nexus_endpoints",
+            osv1.ListNexusEndpointsRequest,
+            osv1.ListNexusEndpointsResponse,
             service="operator",
         )
         self.list_search_attributes = client._new_call(
@@ -609,6 +685,12 @@ class OperatorService:
             "remove_search_attributes",
             osv1.RemoveSearchAttributesRequest,
             osv1.RemoveSearchAttributesResponse,
+            service="operator",
+        )
+        self.update_nexus_endpoint = client._new_call(
+            "update_nexus_endpoint",
+            osv1.UpdateNexusEndpointRequest,
+            osv1.UpdateNexusEndpointResponse,
             service="operator",
         )
 

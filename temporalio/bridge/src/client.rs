@@ -5,8 +5,8 @@ use std::str::FromStr;
 use std::time::Duration;
 use temporal_client::{
     ClientKeepAliveConfig as CoreClientKeepAliveConfig, ClientOptions, ClientOptionsBuilder,
-    ConfiguredClient, HealthService, OperatorService, RetryClient, RetryConfig,
-    TemporalServiceClientWithMetrics, TestService, TlsConfig, WorkflowService,
+    ConfiguredClient, HealthService, HttpConnectProxyOptions, OperatorService, RetryClient,
+    RetryConfig, TemporalServiceClientWithMetrics, TestService, TlsConfig, WorkflowService,
 };
 use tonic::metadata::MetadataKey;
 use url::Url;
@@ -34,6 +34,7 @@ pub struct ClientConfig {
     tls_config: Option<ClientTlsConfig>,
     retry_config: Option<ClientRetryConfig>,
     keep_alive_config: Option<ClientKeepAliveConfig>,
+    http_connect_proxy_config: Option<ClientHttpConnectProxyConfig>,
 }
 
 #[derive(FromPyObject)]
@@ -58,6 +59,12 @@ struct ClientRetryConfig {
 struct ClientKeepAliveConfig {
     pub interval_millis: u64,
     pub timeout_millis: u64,
+}
+
+#[derive(FromPyObject)]
+struct ClientHttpConnectProxyConfig {
+    pub target_host: String,
+    pub basic_auth: Option<(String, String)>,
 }
 
 #[derive(FromPyObject)]
@@ -132,6 +139,7 @@ impl ClientRef {
                 "describe_workflow_execution" => {
                     rpc_call!(retry_client, call, describe_workflow_execution)
                 }
+                "execute_multi_operation" => rpc_call!(retry_client, call, execute_multi_operation),
                 "get_cluster_info" => rpc_call!(retry_client, call, get_cluster_info),
                 "get_search_attributes" => {
                     rpc_call!(retry_client, call, get_search_attributes)
@@ -142,6 +150,9 @@ impl ClientRef {
                 }
                 "get_worker_task_reachability" => {
                     rpc_call!(retry_client, call, get_worker_task_reachability)
+                }
+                "get_worker_versioning_rules" => {
+                    rpc_call!(retry_client, call, get_worker_versioning_rules)
                 }
                 "get_workflow_execution_history" => {
                     rpc_call!(retry_client, call, get_workflow_execution_history)
@@ -177,6 +188,7 @@ impl ClientRef {
                 "poll_activity_task_queue" => {
                     rpc_call!(retry_client, call, poll_activity_task_queue)
                 }
+                "poll_nexus_task_queue" => rpc_call!(retry_client, call, poll_nexus_task_queue),
                 "poll_workflow_execution_update" => {
                     rpc_call!(retry_client, call, poll_workflow_execution_update)
                 }
@@ -218,6 +230,12 @@ impl ClientRef {
                 "respond_activity_task_failed_by_id" => {
                     rpc_call!(retry_client, call, respond_activity_task_failed_by_id)
                 }
+                "respond_nexus_task_completed" => {
+                    rpc_call!(retry_client, call, respond_nexus_task_completed)
+                }
+                "respond_nexus_task_failed" => {
+                    rpc_call!(retry_client, call, respond_nexus_task_failed)
+                }
                 "respond_query_task_completed" => {
                     rpc_call!(retry_client, call, respond_query_task_completed)
                 }
@@ -250,6 +268,9 @@ impl ClientRef {
                 "update_worker_build_id_compatibility" => {
                     rpc_call!(retry_client, call, update_worker_build_id_compatibility)
                 }
+                "update_worker_versioning_rules" => {
+                    rpc_call!(retry_client, call, update_worker_versioning_rules)
+                }
                 _ => {
                     return Err(PyValueError::new_err(format!(
                         "Unknown RPC call {}",
@@ -272,8 +293,12 @@ impl ClientRef {
                 "add_search_attributes" => {
                     rpc_call!(retry_client, call, add_search_attributes)
                 }
+                "create_nexus_endpoint" => rpc_call!(retry_client, call, create_nexus_endpoint),
                 "delete_namespace" => rpc_call!(retry_client, call, delete_namespace),
+                "delete_nexus_endpoint" => rpc_call!(retry_client, call, delete_nexus_endpoint),
+                "get_nexus_endpoint" => rpc_call!(retry_client, call, get_nexus_endpoint),
                 "list_clusters" => rpc_call!(retry_client, call, list_clusters),
+                "list_nexus_endpoints" => rpc_call!(retry_client, call, list_nexus_endpoints),
                 "list_search_attributes" => {
                     rpc_call!(retry_client, call, list_search_attributes)
                 }
@@ -283,6 +308,7 @@ impl ClientRef {
                 "remove_search_attributes" => {
                     rpc_call!(retry_client, call, remove_search_attributes)
                 }
+                "update_nexus_endpoint" => rpc_call!(retry_client, call, update_nexus_endpoint),
                 _ => {
                     return Err(PyValueError::new_err(format!(
                         "Unknown RPC call {}",
@@ -392,6 +418,7 @@ impl TryFrom<ClientConfig> for ClientOptions {
                     .map_or(RetryConfig::default(), |c| c.into()),
             )
             .keep_alive(opts.keep_alive_config.map(Into::into))
+            .http_connect_proxy(opts.http_connect_proxy_config.map(Into::into))
             .headers(Some(opts.metadata))
             .api_key(opts.api_key);
         // Builder does not allow us to set option here, so we have to make
@@ -448,6 +475,15 @@ impl From<ClientKeepAliveConfig> for CoreClientKeepAliveConfig {
         CoreClientKeepAliveConfig {
             interval: Duration::from_millis(conf.interval_millis),
             timeout: Duration::from_millis(conf.timeout_millis),
+        }
+    }
+}
+
+impl From<ClientHttpConnectProxyConfig> for HttpConnectProxyOptions {
+    fn from(conf: ClientHttpConnectProxyConfig) -> Self {
+        HttpConnectProxyOptions {
+            target_addr: conf.target_host,
+            basic_auth: conf.basic_auth,
         }
     }
 }
